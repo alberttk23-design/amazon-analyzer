@@ -18,6 +18,7 @@ if str(BASE_DIR) not in sys.path:
 import backend.db as db
 import backend.session_manager as session_manager
 import backend.diagnostics as diagnostics
+import backend.relevance_engine as relevance_engine
 from datetime import datetime
 
 logger = logging.getLogger("amazon.breadth")
@@ -218,12 +219,25 @@ def extract_cheap_products_from_html(
         if not asin or len(asin) != 10:
             continue
 
-        # Title
-        title_el = card.select_one("h2 a span, h2 span")
-        title = title_el.get_text(strip=True) if title_el else f"Amazon Product {asin}"
+        # Title & Brand
+        all_h2 = [h.get_text(strip=True) for h in card.find_all("h2") if h.get_text(strip=True)]
+        img_el = card.select_one("img.s-image")
+        img_alt = img_el.get("alt", "").strip() if img_el else ""
+
+        card_brand = all_h2[0] if len(all_h2) >= 2 else ""
+        raw_title = all_h2[1] if len(all_h2) >= 2 else (all_h2[0] if all_h2 else "")
+
+        if img_alt and len(img_alt) > len(raw_title) and not img_alt.startswith("Sponsored"):
+            title = img_alt
+        elif card_brand and not raw_title.lower().startswith(card_brand.lower()):
+            title = f"{card_brand} {raw_title}"
+        elif not raw_title and img_alt:
+            title = img_alt
+        else:
+            title = raw_title or f"Amazon Product {asin}"
 
         # URL
-        link_el = card.select_one("h2 a")
+        link_el = card.select_one("h2 a, a.a-link-normal.s-no-outline, a[href*='/dp/']")
         href = link_el.get("href") if link_el else f"/dp/{asin}"
         url = urljoin("https://www.amazon.com", href)
 
@@ -282,7 +296,11 @@ def extract_cheap_products_from_html(
 
         # Brand
         brand_el = card.select_one("h5 .a-size-base-plus, .a-row.a-size-base.a-color-secondary .a-size-base")
-        brand = brand_el.get_text(strip=True) if brand_el else ""
+        brand = card_brand or (brand_el.get_text(strip=True) if brand_el else "")
+        if not brand and title:
+            first_w = title.split()[0]
+            if len(first_w) > 2 and not first_w.isdigit():
+                brand = first_w
 
         # Score calculation (Sales 45%, Reviews 25%, Rating 20%, Badges 10%)
         sales_score = min(bought_month / 2000.0, 1.0) * 45.0
@@ -630,6 +648,17 @@ def run_breadth_discovery_saturation_loop(
                         discovered_brands.add(p["brand"])
                         db.upsert_brand_entity(p["brand"], niche)
 
+                # Classify relevance for data truth
+                try:
+                    rel_result = relevance_engine.classify_product(p, niche=niche, query_context=query)
+                    p["relevance_class"] = rel_result["relevance_class"]
+                    p["relevance_confidence"] = rel_result["relevance_confidence"]
+                    p["relevance_evidence"] = rel_result["relevance_evidence"]
+                    p["relevance_rule_version"] = rel_result["rule_version"]
+                    p["sub_cluster"] = rel_result["sub_cluster"]
+                except Exception as e:
+                    logger.debug(f"Relevance classification error for {asin}: {e}")
+
                 # Save candidate entity without bloating product_snapshots on every search card
                 db.save_product(p, record_snapshot=False)
 
@@ -718,6 +747,13 @@ def run_breadth_discovery_saturation_loop(
         failures_429=failures_429,
         parser_partial=parser_partial
     )
+
+    # Finalize batch relevance classification for the niche
+    try:
+        rel_summary = relevance_engine.classify_niche_products(niche)
+        logger.info(f"[BreadthCrawler] Relevance classification complete for {niche}: {rel_summary}")
+    except Exception as e:
+        logger.warning(f"[BreadthCrawler] Batch relevance classification warning: {e}")
 
     summary = {
         "niche": niche,

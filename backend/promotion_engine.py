@@ -78,6 +78,23 @@ def calculate_product_promotion_signals(product: Dict[str, Any], niche: Optional
             score += 15.0
             reasons.append("recent_price_drop")
 
+    # 8. Relevance Alignment (Core market focus vs accessory opportunity)
+    rel_class = product.get("relevance_class") or "UNKNOWN"
+    sub_cluster = product.get("sub_cluster") or ""
+    if rel_class == "CORE":
+        score += 15.0
+        reasons.append("core_market_product")
+    elif rel_class == "ACCESSORY":
+        if sub_cluster:
+            reasons.append(f"accessory_opportunity({sub_cluster})")
+        else:
+            reasons.append("accessory_product")
+    elif rel_class == "ADJACENT":
+        reasons.append("adjacent_product")
+    elif rel_class == "IRRELEVANT":
+        score = max(0.0, score - 30.0)
+        reasons.append("irrelevant_penalty")
+
     primary_reason = ", ".join(reasons) if reasons else "baseline_signals"
     return round(score, 1), primary_reason
 
@@ -86,6 +103,7 @@ def compute_and_update_niche_promotions(keyword: str) -> Dict[str, Any]:
     """
     Iterates through all candidates in the niche, computes promotion scores,
     and updates database records so the priority queue reflects real-time market dynamics.
+    Prioritizes CORE candidates for HOT promotion.
     """
     candidates = db.get_products(keyword=keyword, limit=5000)
     updated_count = 0
@@ -97,11 +115,16 @@ def compute_and_update_niche_promotions(keyword: str) -> Dict[str, Any]:
         current_tier = cand.get("tier", "COLD")
         score, reason = calculate_product_promotion_signals(cand, niche=keyword)
 
-        # Decide tier promotion
+        # Decide tier promotion: CORE and UNKNOWN can reach HOT, ACCESSORY/ADJACENT capped at WARM
         new_tier = current_tier
+        rel_class = cand.get("relevance_class") or "UNKNOWN"
         if score >= 55.0 and current_tier != "HOT":
-            new_tier = "HOT"
-            promoted_to_hot += 1
+            if rel_class in ("CORE", "UNKNOWN"):
+                new_tier = "HOT"
+                promoted_to_hot += 1
+            else:
+                new_tier = "WARM"
+                promoted_to_warm += 1
         elif score >= 25.0 and current_tier == "COLD":
             new_tier = "WARM"
             promoted_to_warm += 1

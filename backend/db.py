@@ -155,7 +155,7 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_niche ON coverage_ledger(niche)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_session ON coverage_ledger(session_id)")
 
-    # 3.1 Niche Products Junction Table (Entity & Membership Decoupled)
+    # 3.1 Niche Products Junction Table (Entity & Membership Decoupled + Relevance Classification)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS niche_products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +166,12 @@ def init_db():
         discovery_lane TEXT DEFAULT 'keyword_search',
         discovered_via_query TEXT DEFAULT '',
         score REAL DEFAULT 0.0,
+        relevance_class TEXT DEFAULT 'UNKNOWN',
+        relevance_confidence REAL DEFAULT 0.0,
+        relevance_evidence_json TEXT DEFAULT '[]',
+        relevance_rule_version TEXT DEFAULT 'v1.0',
+        sub_cluster TEXT DEFAULT '',
+        classified_at TIMESTAMP,
         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(niche, asin)
@@ -174,6 +180,27 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_niche ON niche_products(niche)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_asin ON niche_products(asin)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_tier ON niche_products(niche, tier)")
+
+    # Migration for new relevance columns if table existed previously
+    cursor.execute("PRAGMA table_info(niche_products)")
+    np_cols = {row["name"] for row in cursor.fetchall()}
+    new_np_cols = [
+        ("relevance_class", "TEXT DEFAULT 'UNKNOWN'"),
+        ("relevance_confidence", "REAL DEFAULT 0.0"),
+        ("relevance_evidence_json", "TEXT DEFAULT '[]'"),
+        ("relevance_rule_version", "TEXT DEFAULT 'v1.0'"),
+        ("sub_cluster", "TEXT DEFAULT ''"),
+        ("classified_at", "TIMESTAMP")
+    ]
+    for col_name, col_def in new_np_cols:
+        if col_name not in np_cols:
+            try:
+                cursor.execute(f"ALTER TABLE niche_products ADD COLUMN {col_name} {col_def}")
+            except Exception as e:
+                print(f"[DB Migration Notice] Add {col_name} to niche_products: {e}")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_rel ON niche_products(niche, relevance_class)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_cluster ON niche_products(niche, sub_cluster)")
 
     # Auto-populate niche_products from products if empty
     cursor.execute("SELECT COUNT(*) FROM niche_products")
@@ -647,18 +674,35 @@ def save_product(p: Dict[str, Any], record_snapshot: bool = True) -> bool:
             "raw_json": raw_json
         })
 
-        # Multi-niche membership persistence (Decouple canonical entity from niche)
+        # Multi-niche membership persistence (Decouple canonical entity from niche + Relevance)
         niche_name = p.get("keyword") or "default"
+        rel_class = p.get("relevance_class") or "UNKNOWN"
+        rel_conf = float(p.get("relevance_confidence") or 0.0)
+        rel_ev = p.get("relevance_evidence_json") if isinstance(p.get("relevance_evidence_json"), str) else json.dumps(p.get("relevance_evidence") or [])
+        rel_ver = p.get("relevance_rule_version") or "v1.0"
+        sub_clust = p.get("sub_cluster") or ""
+
         cursor.execute("""
         INSERT INTO niche_products (
-            niche, asin, tier, tier_reason, discovery_lane, discovered_via_query, score, updated_at
+            niche, asin, tier, tier_reason, discovery_lane, discovered_via_query, score,
+            relevance_class, relevance_confidence, relevance_evidence_json, relevance_rule_version, sub_cluster,
+            classified_at, updated_at
         ) VALUES (
-            :niche, :asin, :tier, :tier_reason, :discovery_lane, :discovered_via_query, :score, CURRENT_TIMESTAMP
+            :niche, :asin, :tier, :tier_reason, :discovery_lane, :discovered_via_query, :score,
+            :relevance_class, :relevance_confidence, :relevance_evidence_json, :relevance_rule_version, :sub_cluster,
+            CASE WHEN :relevance_class != 'UNKNOWN' THEN CURRENT_TIMESTAMP ELSE NULL END,
+            CURRENT_TIMESTAMP
         )
         ON CONFLICT(niche, asin) DO UPDATE SET
             tier = CASE WHEN excluded.tier != 'COLD' THEN excluded.tier ELSE niche_products.tier END,
             tier_reason = CASE WHEN excluded.tier != 'COLD' THEN excluded.tier_reason ELSE niche_products.tier_reason END,
             score = CASE WHEN excluded.score > 0 THEN excluded.score ELSE niche_products.score END,
+            relevance_class = CASE WHEN excluded.relevance_class != 'UNKNOWN' THEN excluded.relevance_class ELSE niche_products.relevance_class END,
+            relevance_confidence = CASE WHEN excluded.relevance_confidence > 0 THEN excluded.relevance_confidence ELSE niche_products.relevance_confidence END,
+            relevance_evidence_json = CASE WHEN excluded.relevance_class != 'UNKNOWN' THEN excluded.relevance_evidence_json ELSE niche_products.relevance_evidence_json END,
+            relevance_rule_version = CASE WHEN excluded.relevance_class != 'UNKNOWN' THEN excluded.relevance_rule_version ELSE niche_products.relevance_rule_version END,
+            sub_cluster = CASE WHEN excluded.sub_cluster != '' THEN excluded.sub_cluster ELSE niche_products.sub_cluster END,
+            classified_at = CASE WHEN excluded.relevance_class != 'UNKNOWN' THEN CURRENT_TIMESTAMP ELSE niche_products.classified_at END,
             updated_at = CURRENT_TIMESTAMP
         """, {
             "niche": niche_name,
@@ -667,7 +711,12 @@ def save_product(p: Dict[str, Any], record_snapshot: bool = True) -> bool:
             "tier_reason": p.get("tier_reason") or "initial_discovery",
             "discovery_lane": p.get("discovery_lane") or "keyword_search",
             "discovered_via_query": p.get("discovered_via_query") or "",
-            "score": float(p.get("score") or 0.0)
+            "score": float(p.get("score") or 0.0),
+            "relevance_class": rel_class,
+            "relevance_confidence": rel_conf,
+            "relevance_evidence_json": rel_ev,
+            "relevance_rule_version": rel_ver,
+            "sub_cluster": sub_clust
         })
 
         if record_snapshot:
@@ -757,6 +806,7 @@ def get_products(
     keyword: Optional[str] = None,
     tier: Optional[str] = None,
     discovery_lane: Optional[str] = None,
+    relevance_filter: Optional[str] = None,
     sort_by: str = "score DESC",
     min_rating: Optional[float] = None,
     is_sponsored: Optional[int] = None,
@@ -775,6 +825,10 @@ def get_products(
                np.discovery_lane as niche_discovery_lane,
                np.discovered_via_query as niche_discovered_via_query,
                np.score as niche_score,
+               np.relevance_class as niche_relevance_class,
+               np.relevance_confidence as niche_relevance_confidence,
+               np.relevance_evidence_json as niche_relevance_evidence_json,
+               np.sub_cluster as niche_sub_cluster,
                np.niche
         FROM products p
         JOIN niche_products np ON p.asin = np.asin
@@ -789,6 +843,24 @@ def get_products(
         if discovery_lane:
             sql += " AND np.discovery_lane = ?"
             params.append(discovery_lane)
+
+        if relevance_filter:
+            rf = relevance_filter.upper()
+            if rf == "CORE":
+                sql += " AND np.relevance_class = 'CORE'"
+            elif rf == "CORE_ADJACENT":
+                sql += " AND np.relevance_class IN ('CORE', 'ADJACENT')"
+            elif rf == "ACCESSORY":
+                sql += " AND np.relevance_class = 'ACCESSORY'"
+            elif rf == "ADJACENT":
+                sql += " AND np.relevance_class = 'ADJACENT'"
+            elif rf == "UNKNOWN":
+                sql += " AND np.relevance_class = 'UNKNOWN'"
+            elif rf == "IRRELEVANT":
+                sql += " AND np.relevance_class = 'IRRELEVANT'"
+            elif rf != "ALL":
+                sql += " AND np.relevance_class = ?"
+                params.append(rf)
     else:
         sql = "SELECT p.* FROM products p WHERE 1=1"
         if tier:
@@ -835,12 +907,16 @@ def get_products(
             d["discovery_lane"] = d.pop("niche_discovery_lane", d.get("discovery_lane"))
             d["discovered_via_query"] = d.pop("niche_discovered_via_query", d.get("discovered_via_query"))
             d["score"] = d.pop("niche_score", d.get("score"))
+            d["relevance_class"] = d.pop("niche_relevance_class", "UNKNOWN")
+            d["relevance_confidence"] = d.pop("niche_relevance_confidence", 0.0)
+            d["relevance_evidence_json"] = d.pop("niche_relevance_evidence_json", "[]")
+            d["sub_cluster"] = d.pop("niche_sub_cluster", "")
         result.append(d)
     return result
 
 
 def get_candidate_universe_summary(keyword: str) -> Dict[str, Any]:
-    """Returns candidate universe statistics: total discovered, cold/warm/hot counts, lane breakdowns."""
+    """Returns candidate universe statistics: total discovered, cold/warm/hot counts, relevance breakdowns."""
     conn = get_db()
     cursor = conn.cursor()
 
@@ -850,7 +926,13 @@ def get_candidate_universe_summary(keyword: str) -> Dict[str, Any]:
             SUM(CASE WHEN np.tier = 'COLD' THEN 1 ELSE 0 END) as cold_count,
             SUM(CASE WHEN np.tier = 'WARM' THEN 1 ELSE 0 END) as warm_count,
             SUM(CASE WHEN np.tier = 'HOT' THEN 1 ELSE 0 END) as hot_count,
+            SUM(CASE WHEN np.relevance_class = 'CORE' THEN 1 ELSE 0 END) as core_count,
+            SUM(CASE WHEN np.relevance_class = 'ADJACENT' THEN 1 ELSE 0 END) as adjacent_count,
+            SUM(CASE WHEN np.relevance_class = 'ACCESSORY' THEN 1 ELSE 0 END) as accessory_count,
+            SUM(CASE WHEN np.relevance_class = 'IRRELEVANT' THEN 1 ELSE 0 END) as irrelevant_count,
+            SUM(CASE WHEN np.relevance_class = 'UNKNOWN' THEN 1 ELSE 0 END) as unknown_count,
             AVG(p.price) as avg_price,
+            AVG(CASE WHEN np.relevance_class = 'CORE' AND p.price > 0 THEN p.price ELSE NULL END) as core_avg_price,
             AVG(p.rating) as avg_rating,
             SUM(p.bought_past_month) as total_monthly_sales
         FROM products p
@@ -871,15 +953,117 @@ def get_candidate_universe_summary(keyword: str) -> Dict[str, Any]:
 
     return {
         "keyword": keyword,
-        "total_candidates": summary_row["total_candidates"] if summary_row else 0,
-        "cold_count": summary_row["cold_count"] if summary_row else 0,
-        "warm_count": summary_row["warm_count"] if summary_row else 0,
-        "hot_count": summary_row["hot_count"] if summary_row else 0,
+        "total_candidates": (summary_row["total_candidates"] or 0) if summary_row else 0,
+        "cold_count": (summary_row["cold_count"] or 0) if summary_row else 0,
+        "warm_count": (summary_row["warm_count"] or 0) if summary_row else 0,
+        "hot_count": (summary_row["hot_count"] or 0) if summary_row else 0,
+        "core_count": (summary_row["core_count"] or 0) if summary_row else 0,
+        "adjacent_count": (summary_row["adjacent_count"] or 0) if summary_row else 0,
+        "accessory_count": (summary_row["accessory_count"] or 0) if summary_row else 0,
+        "irrelevant_count": (summary_row["irrelevant_count"] or 0) if summary_row else 0,
+        "unknown_count": (summary_row["unknown_count"] or 0) if summary_row else 0,
         "avg_price": round(summary_row["avg_price"] or 0.0, 2) if summary_row else 0.0,
+        "core_avg_price": round(summary_row["core_avg_price"] or 0.0, 2) if summary_row else 0.0,
         "avg_rating": round(summary_row["avg_rating"] or 0.0, 1) if summary_row else 0.0,
-        "total_monthly_sales": summary_row["total_monthly_sales"] if summary_row else 0,
+        "total_monthly_sales": (summary_row["total_monthly_sales"] or 0) if summary_row else 0,
         "lanes": {r["discovery_lane"]: r["count"] for r in lane_rows}
     }
+
+
+def update_product_relevance(
+    asin: str,
+    niche: str,
+    relevance_class: str,
+    confidence: float,
+    evidence: List[str],
+    rule_version: str = "v1.0",
+    sub_cluster: str = ""
+) -> bool:
+    """Updates relevance classification on niche_products."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        ev_json = json.dumps(evidence or [], ensure_ascii=False)
+        cursor.execute("""
+        UPDATE niche_products
+        SET relevance_class = ?,
+            relevance_confidence = ?,
+            relevance_evidence_json = ?,
+            relevance_rule_version = ?,
+            sub_cluster = ?,
+            classified_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE niche = ? AND asin = ?
+        """, (relevance_class, confidence, ev_json, rule_version, sub_cluster, niche, asin))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        print(f"[DB Error] update_product_relevance {asin} ({niche}): {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_sub_niche_cluster_aggregates(niche: str) -> List[Dict[str, Any]]:
+    """Aggregates accessories and adjacent items into sub-niche clusters."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        SELECT 
+            np.sub_cluster,
+            np.relevance_class,
+            COUNT(DISTINCT np.asin) as product_count,
+            AVG(p.price) as avg_price,
+            MIN(CASE WHEN p.price > 0 THEN p.price ELSE NULL END) as min_price,
+            MAX(p.price) as max_price,
+            SUM(p.reviews_count) as total_reviews,
+            AVG(CASE WHEN p.rating > 0 THEN p.rating ELSE NULL END) as avg_rating,
+            SUM(p.bought_past_month) as total_monthly_sales,
+            COUNT(DISTINCT CASE WHEN length(p.brand) > 0 THEN p.brand ELSE NULL END) as unique_brands
+        FROM niche_products np
+        JOIN products p ON np.asin = p.asin
+        WHERE np.niche = ? AND np.relevance_class IN ('ACCESSORY', 'ADJACENT') AND length(np.sub_cluster) > 0
+        GROUP BY np.sub_cluster, np.relevance_class
+        ORDER BY product_count DESC
+        """, (niche,))
+        rows = cursor.fetchall()
+        
+        clusters = []
+        for r in rows:
+            sub = r["sub_cluster"]
+            # Get top brands for this cluster
+            cursor.execute("""
+            SELECT p.brand, COUNT(*) as count
+            FROM products p
+            JOIN niche_products np ON p.asin = np.asin
+            WHERE np.niche = ? AND np.sub_cluster = ? AND length(p.brand) > 0
+            GROUP BY p.brand
+            ORDER BY count DESC
+            LIMIT 5
+            """, (niche, sub))
+            top_brands = [dict(b) for b in cursor.fetchall()]
+
+            clusters.append({
+                "sub_cluster": sub,
+                "relevance_class": r["relevance_class"],
+                "product_count": r["product_count"],
+                "avg_price": round(r["avg_price"] or 0.0, 2),
+                "min_price": round(r["min_price"] or 0.0, 2),
+                "max_price": round(r["max_price"] or 0.0, 2),
+                "total_reviews": r["total_reviews"] or 0,
+                "avg_rating": round(r["avg_rating"] or 0.0, 1),
+                "total_monthly_sales": r["total_monthly_sales"] or 0,
+                "unique_brands": r["unique_brands"],
+                "top_brands": [b["brand"] for b in top_brands],
+                "top_brands_detailed": top_brands
+            })
+        return clusters
+    except Exception as e:
+        print(f"[DB Error] get_sub_niche_cluster_aggregates: {e}")
+        return []
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------
@@ -974,7 +1158,8 @@ def get_product_snapshots(asin: str, limit: int = 50) -> List[Dict[str, Any]]:
 def get_priority_candidates(
     keyword: str,
     taxonomy: str = "all",
-    limit: int = 50
+    limit: int = 50,
+    relevance_filter: Optional[str] = "CORE"
 ) -> List[Dict[str, Any]]:
     """
     Query candidate universe across distinct selection taxonomy:
@@ -985,35 +1170,56 @@ def get_priority_candidates(
     - 'high_complaints': high sales but rating <= 3.9 (VoC goldmine)
     - 'ad_active': sponsored products
     - 'long_tail': random representative sample of cold long-tail
+    Filters by relevance_class (defaults to 'CORE') with fallback if unclassified.
     """
     conn = get_db()
     cursor = conn.cursor()
 
-    base_sql = "SELECT * FROM products WHERE keyword = ?"
-    params = [keyword]
+    def build_query(rel: Optional[str]) -> Tuple[str, List[Any]]:
+        sql = """
+            SELECT p.*,
+                   np.relevance_class,
+                   np.sub_cluster
+            FROM products p
+            JOIN niche_products np ON p.asin = np.asin
+            WHERE np.niche = ?
+        """
+        p_list: List[Any] = [keyword]
+        if rel and rel != "ALL":
+            sql += " AND np.relevance_class = ?"
+            p_list.append(rel)
 
-    if taxonomy == "top_performers":
-        base_sql += " ORDER BY bought_past_month DESC, score DESC"
-    elif taxonomy == "emerging_winners":
-        base_sql += " AND bought_past_month >= 500 AND reviews_count <= 2000 ORDER BY bought_past_month DESC"
-    elif taxonomy == "review_velocity_outliers":
-        base_sql += " ORDER BY review_velocity DESC, reviews_count ASC"
-    elif taxonomy == "price_outliers":
-        base_sql += " ORDER BY price DESC"
-    elif taxonomy == "high_complaints":
-        base_sql += " AND rating <= 3.9 AND bought_past_month >= 300 ORDER BY bought_past_month DESC"
-    elif taxonomy == "ad_active":
-        base_sql += " AND is_sponsored = 1 ORDER BY score DESC"
-    elif taxonomy == "long_tail":
-        base_sql += " AND tier = 'COLD' ORDER BY RANDOM()"
-    else:
-        base_sql += " ORDER BY promotion_score DESC, score DESC"
+        if taxonomy == "top_performers":
+            sql += " ORDER BY p.bought_past_month DESC, p.score DESC"
+        elif taxonomy == "emerging_winners":
+            sql += " AND p.bought_past_month >= 500 AND p.reviews_count <= 2000 ORDER BY p.bought_past_month DESC"
+        elif taxonomy == "review_velocity_outliers":
+            sql += " ORDER BY p.review_velocity DESC, p.reviews_count ASC"
+        elif taxonomy == "price_outliers":
+            sql += " ORDER BY p.price DESC"
+        elif taxonomy == "high_complaints":
+            sql += " AND p.rating <= 3.9 AND p.bought_past_month >= 300 ORDER BY p.bought_past_month DESC"
+        elif taxonomy == "ad_active":
+            sql += " AND p.is_sponsored = 1 ORDER BY p.score DESC"
+        elif taxonomy == "long_tail":
+            sql += " AND np.tier = 'COLD' ORDER BY RANDOM()"
+        else:
+            sql += " ORDER BY p.promotion_score DESC, p.score DESC"
 
-    base_sql += " LIMIT ?"
-    params.append(limit)
+        sql += " LIMIT ?"
+        p_list.append(limit)
+        return sql, p_list
 
-    cursor.execute(base_sql, tuple(params))
+    sql, p_list = build_query(relevance_filter)
+    cursor.execute(sql, tuple(p_list))
     rows = cursor.fetchall()
+
+    # Fallback to ALL if no items found for CORE filter (e.g. unclassified niche)
+    if not rows and relevance_filter == "CORE":
+        sql, p_list = build_query(None)
+        cursor.execute(sql, tuple(p_list))
+        rows = cursor.fetchall()
+
     conn.close()
     return [dict(r) for r in rows]
 

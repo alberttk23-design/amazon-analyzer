@@ -77,6 +77,10 @@ interface Product {
   filters_applied?: string;
   variation_dimensions_json?: string;
   child_asins_json?: string;
+  relevance_class?: 'CORE' | 'ADJACENT' | 'ACCESSORY' | 'IRRELEVANT' | 'UNKNOWN';
+  relevance_confidence?: number;
+  relevance_evidence_json?: string;
+  sub_cluster?: string;
 }
 
 interface DiagnosticEntry {
@@ -124,10 +128,29 @@ interface UniverseSummary {
   cold_count: number;
   warm_count: number;
   hot_count: number;
+  core_count?: number;
+  adjacent_count?: number;
+  accessory_count?: number;
+  irrelevant_count?: number;
+  unknown_count?: number;
   avg_price: number;
+  core_avg_price?: number;
   avg_rating: number;
   total_monthly_sales: number;
   lanes: Record<string, number>;
+}
+
+interface RelevanceCluster {
+  sub_cluster: string;
+  relevance_class: string;
+  product_count: number;
+  avg_price: number;
+  min_price: number;
+  max_price: number;
+  avg_reviews: number;
+  total_monthly_sales: number;
+  sample_asins: string[];
+  top_brands: string[];
 }
 
 interface VoCData {
@@ -204,6 +227,9 @@ export default function App() {
   // Filters
   const [tierFilter, setTierFilter] = useState<string>('all');
   const [laneFilter, setLaneFilter] = useState<string>('all');
+  const [relevanceFilter, setRelevanceFilter] = useState<string>('ALL');
+  const [relevanceClusters, setRelevanceClusters] = useState<RelevanceCluster[]>([]);
+  const [isReclassifying, setIsReclassifying] = useState<boolean>(false);
   const [sortBy, setSortBy] = useState<string>('score DESC');
   const [vocSentimentFilter, setVocSentimentFilter] = useState<'all' | 'critical' | 'positive'>('all');
 
@@ -222,7 +248,7 @@ export default function App() {
     if (activeFolder) {
       loadNicheData(activeFolder);
     }
-  }, [activeFolder, sortBy, tierFilter, laneFilter]);
+  }, [activeFolder, sortBy, tierFilter, laneFilter, relevanceFilter]);
 
   // Polling Job
   useEffect(() => {
@@ -370,10 +396,18 @@ export default function App() {
       let candUrl = `${API_BASE}/api/candidates?keyword=${encodeURIComponent(kw)}&sort_by=${encodeURIComponent(sortBy)}&limit=300`;
       if (tierFilter !== 'all') candUrl += `&tier=${encodeURIComponent(tierFilter)}`;
       if (laneFilter !== 'all') candUrl += `&discovery_lane=${encodeURIComponent(laneFilter)}`;
+      if (relevanceFilter !== 'ALL') candUrl += `&relevance_filter=${encodeURIComponent(relevanceFilter)}`;
       const cRes = await fetch(candUrl);
       if (cRes.ok) {
         const cData = await cRes.json();
         setCandidates(cData.candidates || []);
+      }
+
+      // 2.1 Sub-Niche Clusters (Accessories / Adjacent Segmentation)
+      const rcRes = await fetch(`${API_BASE}/api/relevance/clusters?keyword=${encodeURIComponent(kw)}`);
+      if (rcRes.ok) {
+        const rcData = await rcRes.json();
+        setRelevanceClusters(rcData.clusters || []);
       }
 
       // 3. Priority Queue Feed
@@ -414,6 +448,25 @@ export default function App() {
       console.error('Error loading niche data:', err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleReclassifyNiche = async () => {
+    if (!activeFolder) return;
+    setIsReclassifying(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/relevance/reclassify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ niche: activeFolder })
+      });
+      if (res.ok) {
+        await loadNicheData(activeFolder);
+      }
+    } catch (e) {
+      console.error('Error reclassifying niche:', e);
+    } finally {
+      setIsReclassifying(false);
     }
   };
 
@@ -780,6 +833,48 @@ export default function App() {
               {coverageLedger[0]?.marginal_yield != null ? `Yield gần nhất: ${coverageLedger[0].marginal_yield}%` : 'Sẵn sàng'}
             </p>
           </div>
+        </section>
+
+        {/* Relevance Truth & Domain Guardrails Summary Bar */}
+        <section className="bg-zinc-900/70 border border-zinc-800/80 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-md">
+          <div className="flex flex-wrap items-center gap-4 text-xs">
+            <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1.5 rounded-xl">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+              <span className="text-zinc-400 font-medium">CORE Market:</span>
+              <span className="font-bold text-emerald-300">{universeSummary?.core_count || 0} sản phẩm</span>
+              <span className="text-[11px] text-zinc-500 ml-1 font-mono">
+                (Avg: ${(universeSummary?.core_avg_price || 0).toFixed(2)})
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 bg-sky-500/10 border border-sky-500/20 px-3 py-1.5 rounded-xl">
+              <span className="w-2.5 h-2.5 rounded-full bg-sky-400"></span>
+              <span className="text-zinc-400 font-medium">ADJACENT:</span>
+              <span className="font-bold text-sky-300">{universeSummary?.adjacent_count || 0}</span>
+            </div>
+
+            <div className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 px-3 py-1.5 rounded-xl">
+              <span className="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+              <span className="text-zinc-400 font-medium">ACCESSORIES:</span>
+              <span className="font-bold text-amber-300">{universeSummary?.accessory_count || 0} phụ kiện</span>
+            </div>
+
+            <div className="flex items-center gap-1.5 bg-zinc-800/60 border border-zinc-700/40 px-3 py-1.5 rounded-xl">
+              <span className="w-2.5 h-2.5 rounded-full bg-zinc-500"></span>
+              <span className="text-zinc-400 font-medium">UNKNOWN:</span>
+              <span className="font-bold text-zinc-300">{universeSummary?.unknown_count || 0}</span>
+            </div>
+          </div>
+
+          <button
+            onClick={handleReclassifyNiche}
+            disabled={isReclassifying}
+            className="flex items-center gap-2 text-xs font-semibold px-3.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 disabled:opacity-50 transition shadow-sm"
+            title="Chạy lại Taxonomy Engine trên toàn bộ ứng viên trong ngách"
+          >
+            <RefreshCw size={13} className={isReclassifying ? "animate-spin text-amber-400" : "text-amber-400"} />
+            <span>{isReclassifying ? "Đang phân loại..." : "Áp Dụng Phân Loại Relevance"}</span>
+          </button>
         </section>
 
         {/* Visual Charts Component (Saturation Curve, Price vs Rating, Sales, VoC) */}
@@ -1170,6 +1265,38 @@ export default function App() {
         {/* TAB 1: CANDIDATE UNIVERSE & COVERAGE LEDGER */}
         {activeTab === 'universe' && (
           <div className="space-y-6">
+            {/* Relevance Class Filter Tabs */}
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-zinc-900/80 p-3 rounded-2xl border border-zinc-800">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-zinc-400 font-semibold mr-1 flex items-center gap-1">
+                  <Target size={14} className="text-amber-400" /> Lọc Phân Loại Relevance:
+                </span>
+                {[
+                  { id: 'ALL', label: 'Tất Cả Ứng Viên', count: universeSummary?.total_candidates || candidates.length, color: 'text-zinc-300' },
+                  { id: 'CORE', label: '🎯 CORE Market Only', count: universeSummary?.core_count || 0, color: 'text-emerald-400' },
+                  { id: 'CORE_ADJACENT', label: '🎯+🧭 Core & Adjacent', count: (universeSummary?.core_count || 0) + (universeSummary?.adjacent_count || 0), color: 'text-emerald-300' },
+                  { id: 'ACCESSORY', label: '🧩 Phụ Kiện (Accessories)', count: universeSummary?.accessory_count || 0, color: 'text-amber-400' },
+                  { id: 'ADJACENT', label: '🧭 Sản Phẩm Lân Cận (Adjacent)', count: universeSummary?.adjacent_count || 0, color: 'text-sky-400' },
+                  { id: 'UNKNOWN', label: '❓ Chưa Rõ (Unknown)', count: universeSummary?.unknown_count || 0, color: 'text-zinc-400' }
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setRelevanceFilter(tab.id)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition border ${
+                      relevanceFilter === tab.id
+                        ? 'bg-zinc-800 border-amber-400 text-white shadow'
+                        : 'bg-zinc-900/60 border-zinc-800 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+                    }`}
+                  >
+                    <span>{tab.label}</span>
+                    <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-zinc-950 ${tab.color}`}>
+                      {tab.count}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {/* Multi-Lane & Tier Filters */}
             <div className="flex flex-wrap items-center justify-between gap-3 bg-zinc-900/60 p-3.5 rounded-2xl border border-zinc-800 text-xs">
               <div className="flex flex-wrap items-center gap-3">
@@ -1216,6 +1343,78 @@ export default function App() {
                 </select>
               </div>
             </div>
+
+            {/* Sub-Niche Clusters Section */}
+            {relevanceClusters.length > 0 && (
+              <div className="bg-zinc-900/90 border border-zinc-800 rounded-2xl p-5 shadow-xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-bold text-zinc-100 flex items-center gap-2">
+                      <Package size={16} className="text-sky-400" />
+                      Phân Khúc Phụ Kiện & Cụm Sản Phẩm Liên Quan (Sub-Niche Clusters)
+                    </h3>
+                    <p className="text-xs text-zinc-400 mt-0.5">
+                      Tự động gom cụm các sản phẩm phụ trợ (locks, tags, covers, wheels...) để khám phá cơ hội bundle và phụ kiện
+                    </p>
+                  </div>
+                  <span className="text-xs font-mono text-zinc-400 bg-zinc-800 px-2 py-1 rounded-lg">
+                    {relevanceClusters.length} cụm phân khúc
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                  {relevanceClusters.map((cluster) => (
+                    <div
+                      key={cluster.sub_cluster}
+                      className="bg-zinc-950/70 border border-zinc-800/80 rounded-xl p-3.5 space-y-2.5 hover:border-zinc-700 transition"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-amber-300 uppercase tracking-wide flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+                          {cluster.sub_cluster}
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300">
+                          {cluster.product_count} items
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-zinc-800/60">
+                        <div>
+                          <span className="text-zinc-500 block text-[10px]">Giá Trung Bình</span>
+                          <span className="font-bold text-emerald-400">${cluster.avg_price}</span>
+                          <span className="text-[9px] text-zinc-500 ml-1">(${cluster.min_price} - ${cluster.max_price})</span>
+                        </div>
+                        <div>
+                          <span className="text-zinc-500 block text-[10px]">Doanh Số Tháng</span>
+                          <span className="font-bold text-zinc-200">{cluster.total_monthly_sales.toLocaleString()}</span>
+                        </div>
+                      </div>
+
+                      {cluster.top_brands && cluster.top_brands.length > 0 && (
+                        <div className="text-[10px] text-zinc-400 flex items-center gap-1 truncate">
+                          <span className="text-zinc-500 font-medium">Top brands:</span>
+                          <span className="text-zinc-300 truncate">{cluster.top_brands.join(', ')}</span>
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-between pt-1">
+                        <span className="text-[10px] text-zinc-500 font-mono">
+                          Avg Reviews: {cluster.avg_reviews.toLocaleString()}
+                        </span>
+                        <button
+                          onClick={() => {
+                            setRelevanceFilter('ACCESSORY');
+                          }}
+                          className="text-[10px] text-amber-400 hover:text-amber-300 font-semibold"
+                        >
+                          Xem items ➔
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Candidate Universe Table */}
             <div className="bg-zinc-900/90 border border-zinc-800 rounded-2xl overflow-hidden shadow-xl">
@@ -1301,6 +1500,27 @@ export default function App() {
                               >
                                 {p.tier}
                               </span>
+                              {p.relevance_class && (
+                                <span
+                                  className={`text-[9px] font-bold px-1.5 py-0.5 rounded inline-block ${
+                                    p.relevance_class === 'CORE'
+                                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                      : p.relevance_class === 'ACCESSORY'
+                                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                      : p.relevance_class === 'ADJACENT'
+                                      ? 'bg-sky-500/20 text-sky-300 border border-sky-500/30'
+                                      : p.relevance_class === 'IRRELEVANT'
+                                      ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                      : 'bg-zinc-800 text-zinc-400 border border-zinc-700'
+                                  }`}
+                                  title={p.sub_cluster ? `Phân khúc: ${p.sub_cluster}` : p.relevance_class}
+                                >
+                                  {p.relevance_class === 'CORE' ? '🎯 CORE' :
+                                   p.relevance_class === 'ACCESSORY' ? `🧩 ACC${p.sub_cluster ? `:${p.sub_cluster}` : ''}` :
+                                   p.relevance_class === 'ADJACENT' ? '🧭 ADJ' :
+                                   p.relevance_class}
+                                </span>
+                              )}
                               {(p.is_parent === 1 || (p.variant_count && p.variant_count > 1)) && (
                                 <button
                                   onClick={() => openVariationModal(p.asin)}
@@ -1602,6 +1822,20 @@ export default function App() {
                       }`}>
                         {p.tier}
                       </span>
+                      {p.relevance_class && (
+                        <span className={`text-[9px] font-black px-1.5 py-0.5 rounded shadow ${
+                          p.relevance_class === 'CORE' ? 'bg-emerald-600 text-white' :
+                          p.relevance_class === 'ACCESSORY' ? 'bg-amber-600 text-white' :
+                          p.relevance_class === 'ADJACENT' ? 'bg-sky-600 text-white' :
+                          p.relevance_class === 'IRRELEVANT' ? 'bg-rose-700 text-white' :
+                          'bg-zinc-700 text-zinc-300'
+                        }`}>
+                          {p.relevance_class === 'CORE' ? '🎯 CORE' :
+                           p.relevance_class === 'ACCESSORY' ? `🧩 ACC${p.sub_cluster ? `:${p.sub_cluster}` : ''}` :
+                           p.relevance_class === 'ADJACENT' ? '🧭 ADJ' :
+                           p.relevance_class}
+                        </span>
+                      )}
                       {Boolean(p.is_best_seller) && (
                         <span className="bg-amber-500 text-zinc-950 text-[9px] font-black px-1.5 py-0.5 rounded">
                           #1 BEST SELLER

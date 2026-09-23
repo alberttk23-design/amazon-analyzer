@@ -20,6 +20,7 @@ import backend.session_manager as session_manager
 import backend.breadth_crawler as breadth_crawler
 import backend.depth_crawler as depth_crawler
 import backend.promotion_engine as promotion_engine
+import backend.relevance_engine as relevance_engine
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 EXPORTS_DIR = BASE_DIR / "exports"
@@ -100,6 +101,10 @@ class CreateFolderRequest(BaseModel):
 
 class RenameFolderRequest(BaseModel):
     new_name: str
+
+
+class ReclassifyRequest(BaseModel):
+    niche: str
 
 
 class MergeFolderRequest(BaseModel):
@@ -385,6 +390,7 @@ def list_candidates(
     niche: Optional[str] = None,
     tier: Optional[str] = None,
     discovery_lane: Optional[str] = None,
+    relevance_filter: Optional[str] = None,
     sort_by: str = "score DESC",
     min_rating: Optional[float] = None,
     is_sponsored: Optional[int] = None,
@@ -396,6 +402,7 @@ def list_candidates(
         keyword=kw,
         tier=tier,
         discovery_lane=discovery_lane,
+        relevance_filter=relevance_filter,
         sort_by=sort_by,
         min_rating=min_rating,
         is_sponsored=is_sponsored,
@@ -405,8 +412,34 @@ def list_candidates(
     return {
         "keyword": keyword,
         "tier": tier,
+        "relevance_filter": relevance_filter,
         "total": len(items),
         "candidates": items
+    }
+
+
+@app.get("/api/relevance/clusters")
+def get_relevance_clusters(keyword: Optional[str] = None, niche: Optional[str] = None):
+    kw = (keyword or niche or "").strip()
+    if not kw:
+        return {"niche": "", "total_clusters": 0, "clusters": []}
+    clusters = relevance_engine.get_sub_niche_clusters(kw)
+    return {
+        "niche": kw,
+        "total_clusters": len(clusters),
+        "clusters": clusters
+    }
+
+
+@app.post("/api/relevance/reclassify")
+def reclassify_niche(req: ReclassifyRequest):
+    kw = req.niche.strip()
+    if not kw:
+        raise HTTPException(status_code=400, detail="niche is required")
+    summary = relevance_engine.classify_niche_products(kw)
+    return {
+        "niche": kw,
+        "summary": summary
     }
 
 
