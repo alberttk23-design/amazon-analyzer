@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+env/
+venv/
+*.log
+
+# Database and SQLite Journals
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+
+# Browser Profile (Contains private cookies, cache, tokens)
+data/browser_profile/
+data/debug/
+!data/.gitkeep
+
+# Node & Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.log
+
+# Exports & Temporary artifacts
+exports/*
+!exports/.gitkeep
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
