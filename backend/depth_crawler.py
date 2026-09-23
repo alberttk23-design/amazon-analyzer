@@ -180,7 +180,7 @@ def scrape_amazon_product_detail_and_variations(
                     childAsins,
                     dimensions
                 };
-            """)
+            }""")
 
             price = parse_detail_price(data.get("priceText", ""))
             original_price = parse_detail_price(data.get("origText", "")) or price

@@ -163,11 +163,11 @@ const API_BASE = 'http://127.0.0.1:8001';
 export default function App() {
   // Navigation Tabs
   const [activeTab, setActiveTab] = useState<'acquisition_report' | 'universe' | 'priority_queue' | 'products' | 'voc' | 'blueprint' | 'ads_bs' | 'session' | 'folders'>('acquisition_report');
-  const [activeFolder, setActiveFolder] = useState<string>('portable blender');
+  const [activeFolder, setActiveFolder] = useState<string>(() => localStorage.getItem('amazon_analyzer_active_folder') || 'Luggage');
   const [folders, setFolders] = useState<Folder[]>([]);
 
   // Search & Acquisition Controls
-  const [keywordInput, setKeywordInput] = useState<string>('portable blender');
+  const [keywordInput, setKeywordInput] = useState<string>(() => localStorage.getItem('amazon_analyzer_active_folder') || 'Luggage');
   const [maxQueries, setMaxQueries] = useState<number>(20);
   const [autoDepthAfterBreadth, setAutoDepthAfterBreadth] = useState<boolean>(true);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
@@ -237,7 +237,7 @@ export default function App() {
 
         if (data.status === 'completed' || data.status === 'failed') {
           setActiveJobId(null);
-          loadFolders();
+          loadFolders(activeFolder);
           if (activeFolder) loadNicheData(activeFolder);
         }
       } catch (err) {
@@ -248,13 +248,27 @@ export default function App() {
     return () => clearInterval(interval);
   }, [activeJobId, activeFolder]);
 
-  const loadFolders = async () => {
+  const loadFolders = async (preferFolder?: string) => {
     try {
       const res = await fetch(`${API_BASE}/api/folders`);
       const data = await res.json();
       setFolders(data);
+      const target = preferFolder || activeFolder || localStorage.getItem('amazon_analyzer_active_folder');
+      if (target && data.length > 0) {
+        const matched = data.find((f: Folder) => f.name.toLowerCase() === target.toLowerCase());
+        if (matched) {
+          if (activeFolder !== matched.name) {
+            setActiveFolder(matched.name);
+            setKeywordInput(matched.name);
+          }
+          localStorage.setItem('amazon_analyzer_active_folder', matched.name);
+          return;
+        }
+      }
       if (data.length > 0 && !activeFolder) {
         setActiveFolder(data[0].name);
+        setKeywordInput(data[0].name);
+        localStorage.setItem('amazon_analyzer_active_folder', data[0].name);
       }
     } catch (err) {
       console.error('Error loading folders:', err);
@@ -421,9 +435,13 @@ export default function App() {
       });
       const data = await res.json();
       if (data.job_id) {
+        const folderName = data.folder || kw;
         setActiveJobId(data.job_id);
-        setActiveFolder(kw);
+        setActiveFolder(folderName);
+        setKeywordInput(folderName);
+        localStorage.setItem('amazon_analyzer_active_folder', folderName);
         setJobProgress({ status: 'started', progress: 5, message: 'Khởi động Multi-Lane Breadth Discovery...' });
+        loadFolders(folderName);
       }
     } catch (err) {
       console.error('Error starting acquisition:', err);
@@ -563,7 +581,12 @@ export default function App() {
             <span className="text-zinc-400 font-medium">Niche:</span>
             <select
               value={activeFolder}
-              onChange={(e) => setActiveFolder(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                setActiveFolder(val);
+                setKeywordInput(val);
+                localStorage.setItem('amazon_analyzer_active_folder', val);
+              }}
               className="bg-transparent font-bold text-amber-300 focus:outline-none cursor-pointer"
             >
               {folders.map((f) => (
@@ -1966,7 +1989,11 @@ export default function App() {
               {folders.map((f) => (
                 <div
                   key={f.name}
-                  onClick={() => setActiveFolder(f.name)}
+                  onClick={() => {
+                    setActiveFolder(f.name);
+                    setKeywordInput(f.name);
+                    localStorage.setItem('amazon_analyzer_active_folder', f.name);
+                  }}
                   className={`p-4 rounded-2xl border cursor-pointer transition ${
                     activeFolder === f.name
                       ? 'bg-amber-500/10 border-amber-500/50 shadow-lg'

@@ -196,6 +196,7 @@ def start_analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
 
     pool_name = (req.target_folder or kw).strip()
     job_id = str(uuid.uuid4())[:8]
+    db.create_niche_folder(pool_name)
     db.create_job(job_id, pool_name)
 
     background_tasks.add_task(
