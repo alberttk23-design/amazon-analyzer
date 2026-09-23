@@ -234,7 +234,7 @@ def extract_cheap_products_from_html(
         elif not raw_title and img_alt:
             title = img_alt
         else:
-            title = raw_title or f"Amazon Product {asin}"
+            title = raw_title or img_alt or ""
 
         # URL
         link_el = card.select_one("h2 a, a.a-link-normal.s-no-outline, a[href*='/dp/']")
@@ -245,9 +245,9 @@ def extract_cheap_products_from_html(
         price_off = card.select_one(".a-price .a-offscreen")
         price = parse_price(price_off.get_text(strip=True)) if price_off else 0.0
 
-        # Original / Strike price
+        # Original / Strike price (unobserved strike price remains 0.0, never fake list price as current price)
         orig_off = card.select_one(".a-text-price .a-offscreen, .a-price[data-a-strike='true'] .a-offscreen")
-        orig_price = parse_price(orig_off.get_text(strip=True)) if orig_off else price
+        orig_price = parse_price(orig_off.get_text(strip=True)) if orig_off else 0.0
 
         # Rating
         star_el = card.select_one(".a-icon-star-small .a-icon-alt, .a-icon-alt")
@@ -294,13 +294,21 @@ def extract_cheap_products_from_html(
         img_el = card.select_one("img.s-image")
         image_url = img_el.get("src") if img_el else ""
 
-        # Brand
+        # Brand: extract directly from card markup; NEVER invent brand from first word of title
         brand_el = card.select_one("h5 .a-size-base-plus, .a-row.a-size-base.a-color-secondary .a-size-base")
         brand = card_brand or (brand_el.get_text(strip=True) if brand_el else "")
-        if not brand and title:
-            first_w = title.split()[0]
-            if len(first_w) > 2 and not first_w.isdigit():
-                brand = first_w
+
+        # Real Amazon Category / Product Type Extraction (No faking bsr_category = niche)
+        csa_pt_el = card.select_one("[data-csa-c-product-type]")
+        csa_product_type = csa_pt_el.get("data-csa-c-product-type", "").strip() if csa_pt_el else ""
+        csa_it_el = card.select_one("[data-csa-c-item-type]")
+        csa_item_type = csa_it_el.get("data-csa-c-item-type", "").strip() if csa_it_el else ""
+
+        extracted_category = ""
+        if csa_product_type:
+            extracted_category = csa_product_type.replace("_", " ").title()
+        elif csa_item_type:
+            extracted_category = csa_item_type.replace("_", " ").title()
 
         # Score calculation (Sales 45%, Reviews 25%, Rating 20%, Badges 10%)
         sales_score = min(bought_month / 2000.0, 1.0) * 45.0
@@ -323,7 +331,7 @@ def extract_cheap_products_from_html(
             "reviews_count": reviews_count,
             "bought_past_month": bought_month,
             "bsr_rank": 0,
-            "bsr_category": niche,
+            "bsr_category": extracted_category,
             "is_sponsored": 1 if placement_type == "SPONSORED" else 0,
             "is_best_seller": is_best_seller,
             "is_amazons_choice": is_choice,
@@ -583,6 +591,7 @@ def run_breadth_discovery_saturation_loop(
         # True Page-Level Checkpoint / Resume
         start_page = max(1, item.get("next_page", 1))
         target_pages = item.get("target_pages", max_pages_per_query)
+        query_interrupted = False
 
         # Multi-Page Pagination Loop (Page start_page to target_pages)
         for page_num in range(start_page, target_pages + 1):
@@ -618,7 +627,8 @@ def run_breadth_discovery_saturation_loop(
                     status=f"empty_or_{status}",
                     strategy_used=strategy_used
                 )
-                db.update_query_progress(niche, query, page_num, status="in_progress", error=f"empty_or_{status}")
+                db.update_query_progress(niche, query, page_num, status="failed", error=f"empty_or_{status}", success=False)
+                query_interrupted = True
                 break
 
             products, observations = extract_cheap_products_from_html(
@@ -627,7 +637,8 @@ def run_breadth_discovery_saturation_loop(
             asins_found_page = len(products)
             if asins_found_page == 0:
                 parser_partial += 1
-                db.update_query_progress(niche, query, page_num, status="in_progress", error="zero_products_parsed")
+                db.update_query_progress(niche, query, page_num, status="failed", error="zero_products_parsed", success=False)
+                query_interrupted = True
                 break
 
             page_new_unique = 0
@@ -670,7 +681,7 @@ def run_breadth_discovery_saturation_loop(
             query_total_asins += asins_found_page
 
             # Update page progress in queue checkpoint
-            db.update_query_progress(niche, query, page_num, status="in_progress")
+            db.update_query_progress(niche, query, page_num, status="in_progress", success=True)
 
             # Log entry to Coverage Ledger for this specific page
             db.record_coverage_ledger_entry(
@@ -706,7 +717,10 @@ def run_breadth_discovery_saturation_loop(
             time.sleep(random.uniform(0.6, 1.3))
 
         marginal_yield = round((query_new_asins / query_total_asins * 100), 2) if query_total_asins > 0 else 0.0
-        db.mark_discovery_query_status(niche, query, "completed")
+        if query_interrupted:
+            db.mark_discovery_query_status(niche, query, "failed", error=f"interrupted_on_page_{page_num}")
+        else:
+            db.mark_discovery_query_status(niche, query, "completed")
 
         # Check Saturation condition
         if query_total_asins >= 10 and marginal_yield < saturation_threshold_yield:

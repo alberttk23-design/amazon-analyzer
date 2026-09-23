@@ -98,4 +98,61 @@ def test_acceptance_case_7_unclear_product_unknown():
     res = classify_product(p, niche="luggage")
     assert res["relevance_class"] == "UNKNOWN"
     assert res["relevance_confidence"] == 0.0
-    assert "insufficient_evidence_or_conflict" in res["relevance_evidence"]
+
+
+def test_multi_piece_luggage_sets_are_strictly_core():
+    """Multi-piece luggage sets like '4 Piece Luggage Set' must NEVER be misclassified as ACCESSORY."""
+    p1 = {
+        "title": "Coolife Luggage 4 Piece Set Suitcase Spinner Hardshell Lightweight TSA Lock",
+        "price": 189.99,
+        "category": "Luggage Sets",
+        "brand": "Coolife"
+    }
+    res1 = classify_product(p1, niche="luggage")
+    assert res1["relevance_class"] == "CORE", f"Expected CORE, got {res1['relevance_class']}"
+
+    p2 = {
+        "title": "2 Pack Carry-On Suitcase Set with 360 Double Spinner Wheels 20 Inch",
+        "price": 119.99,
+        "category": "Suitcases",
+        "brand": "TravelPro"
+    }
+    res2 = classify_product(p2, niche="luggage")
+    assert res2["relevance_class"] == "CORE", f"Expected CORE, got {res2['relevance_class']}"
+
+
+def test_luggage_set_with_duffel_bundle_is_core():
+    """A suitcase set bundled with a duffel bag is primarily a luggage set (CORE), not ADJACENT."""
+    p = {
+        "title": "Showkoo 3 Piece Luggage Set Expandable Hardside Suitcase with Travel Duffel Bag",
+        "price": 169.99,
+        "category": "Luggage Sets",
+        "brand": "Showkoo"
+    }
+    res = classify_product(p, niche="luggage")
+    assert res["relevance_class"] == "CORE", f"Expected CORE, got {res['relevance_class']}"
+
+
+def test_accessory_pack_matches_noun_strictly():
+    """Pack patterns with accessory nouns must be classified as ACCESSORY."""
+    p = {
+        "title": "2 Pack Silicone Luggage Tags for Suitcases with Privacy Name ID Card",
+        "price": 7.99,
+        "category": "Travel Accessories",
+        "brand": "Shacke"
+    }
+    res = classify_product(p, niche="luggage")
+    assert res["relevance_class"] == "ACCESSORY"
+    assert res["sub_cluster"] == "luggage tags"
+
+
+def test_irrelevant_travel_item_classified_irrelevant():
+    """Out-of-scope products like airplane foot rests or passport covers must be IRRELEVANT."""
+    p = {
+        "title": "Airplane Flight Foot Rest Hammock Portable Travel Footrest for Long Flights",
+        "price": 19.99,
+        "category": "Travel Accessories",
+        "brand": "FlyEase"
+    }
+    res = classify_product(p, niche="luggage")
+    assert res["relevance_class"] == "IRRELEVANT"

@@ -125,3 +125,60 @@ def test_review_depth_status_and_verified_strict():
     assert prod["review_depth"] == "PARTIAL"
     assert prod["collection_method"] == "representative_polarity"
     assert prod["tier"] == "HOT"
+
+
+def test_review_corpus_vs_policy_status_semantics():
+    """Never report review_depth = FULL when 30 reviews collected on a 5000-review product."""
+    db.init_db()
+    unique_suffix = uuid.uuid4().hex[:6].upper()
+    test_asin = f"B0CORP_{unique_suffix}"
+    niche = f"Corpus_Niche_{unique_suffix}"
+
+    db.save_product({
+        "asin": test_asin,
+        "title": "Corpus Semantics Test Luggage",
+        "price": 129.99,
+        "reviews_count": 5000,
+        "keyword": niche,
+        "product_depth": "FULL"
+    })
+
+    # Policy target = 30 reviews collected
+    fake_30_reviews = [
+        {
+            "review_id": f"R_{unique_suffix}_30_{i}",
+            "asin": test_asin,
+            "star_rating": 1 if i < 15 else 5,
+            "review_title": f"Review {i}",
+            "review_text": f"Text {i}",
+            "verified_purchase": True
+        }
+        for i in range(30)
+    ]
+
+    saved = db.save_reviews(
+        asin=test_asin,
+        keyword=niche,
+        reviews_list=fake_30_reviews,
+        collection_method="representative_polarity",
+        critical_visible_reviews=48,
+        positive_visible_reviews=4800,
+        critical_collected=15,
+        positive_collected=15
+    )
+    assert saved == 30
+
+    prod = db.get_product_by_asin(test_asin)
+    # 1. Total product reviews must NOT be overwritten by filtered counts (48) or collected count (30)
+    assert prod["visible_total_reviews"] == 5000
+    assert prod["reviews_count"] == 5000
+    # 2. Filtered counts tracked in dedicated columns
+    assert prod["critical_visible_reviews"] == 48
+    assert prod["positive_visible_reviews"] == 4800
+    assert prod["critical_reviews_collected"] == 15
+    assert prod["positive_reviews_collected"] == 15
+    # 3. Policy completed, but corpus is PARTIAL, never FULL!
+    assert prod["collection_policy_status"] == "COMPLETE"
+    assert prod["review_corpus_coverage"] == "PARTIAL"
+    assert prod["review_depth"] == "PARTIAL", "review_depth must remain PARTIAL when only 30 of 5000 reviews collected!"
+

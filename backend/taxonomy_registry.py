@@ -12,6 +12,7 @@ TAXONOMY_CONFIGS: Dict[str, Dict[str, Any]] = {
         "core_product_phrases": [
             "carry-on suitcase", "carry on suitcase", "carry-on luggage", "carry on luggage",
             "checked luggage", "checked suitcase", "spinner suitcase", "luggage set",
+            "suitcase set", "piece luggage set", "piece suitcase set", "piece set",
             "hardside luggage", "hard shell luggage", "expandable suitcase", "rolling suitcase",
             "spinner luggage", "upright suitcase", "travel suitcase", "polycarbonate suitcase",
             "hardshell suitcase", "rolling luggage", "underseat luggage", "wheeled luggage",
@@ -20,13 +21,15 @@ TAXONOMY_CONFIGS: Dict[str, Dict[str, Any]] = {
         ],
         "adjacent_categories": {
             "duffel bags": [
-                "duffel bag", "duffle bag", "weekender bag", "travel duffel", "gym duffel", "rolling duffel"
+                "duffel bag", "duffle bag", "weekender bag", "travel duffel", "gym duffel", "rolling duffel",
+                "foldable travel duffel", "overnight weekender"
             ],
             "travel backpacks": [
-                "travel backpack", "carry on backpack", "flight approved backpack", "luggage backpack"
+                "travel backpack", "carry on backpack", "flight approved backpack", "luggage backpack",
+                "travel laptop backpack", "laptop backpack", "travel business backpack"
             ],
             "garment bags": [
-                "garment bag", "suit carrier", "dress bag", "suit bag"
+                "garment bag", "suit carrier", "dress bag", "suit bag", "hanging garment bag"
             ],
             "tote bags": [
                 "travel tote", "flight bag", "underseat tote", "weekender tote"
@@ -35,7 +38,8 @@ TAXONOMY_CONFIGS: Dict[str, Dict[str, Any]] = {
         "accessory_categories": {
             "luggage locks": [
                 "luggage lock", "suitcase lock", "tsa approved lock", "tsa lock",
-                "travel padlock", "combination lock for luggage", "luggage locks"
+                "travel padlock", "combination lock for luggage", "luggage locks",
+                "padlock", "padlocks", "dial padlock", "combination padlock"
             ],
             "luggage tags": [
                 "luggage tag", "suitcase tag", "bag tag", "baggage tag",
@@ -48,19 +52,21 @@ TAXONOMY_CONFIGS: Dict[str, Dict[str, Any]] = {
             "replacement parts": [
                 "replacement spinner wheels", "replacement wheel", "replacement wheels", "replacement handle",
                 "luggage wheel", "suitcase wheel", "spare wheel", "luggage replacement wheels",
-                "swivel casters"
+                "swivel casters", "handle replacement", "spare parts", "repair kit"
             ],
             "straps": [
-                "luggage strap", "suitcase strap", "cross strap", "bag strap", "luggage belts"
+                "luggage strap", "luggage straps", "suitcase strap", "suitcase straps", "cross strap",
+                "bag strap", "luggage belts", "travel belt", "travel belts", "suitcase belts"
             ],
             "scales": [
-                "luggage scale", "travel scale", "hanging baggage scale", "weight scale for luggage"
+                "luggage scale", "travel scale", "hanging baggage scale", "weight scale for luggage",
+                "baggage scale", "baggage scales", "travel baggage scale", "postal weight scale"
             ],
             "packing cubes": [
                 "packing cube", "packing cubes", "compression packing cube", "travel organizer bags"
             ],
             "cup holders": [
-                "luggage cup holder", "suitcase cup holder", "travel cup holder"
+                "luggage cup holder", "suitcase cup holder", "travel cup holder", "drink caddy"
             ]
         },
         "embedded_feature_guards": [
@@ -79,7 +85,8 @@ TAXONOMY_CONFIGS: Dict[str, Dict[str, Any]] = {
         ],
         "relational_accessory_guards": [
             "for suitcase", "for luggage", "for carry-on", "fits 20-28", "replacement for",
-            "compatible with samsonite", "pack of", "4 pack", "2 pack"
+            "compatible with samsonite",
+            r'(?:pack of|\d+\s*pack)\s+(?:luggage\s+)?(?:locks?|tags?|straps?|wheels?|scales?)'
         ],
         "category_signals": {
             "core": ["suitcases", "luggage sets", "carry-ons"],
@@ -89,7 +96,14 @@ TAXONOMY_CONFIGS: Dict[str, Dict[str, Any]] = {
         "price_thresholds": {
             "accessory_typical_max": 35.0,
             "core_typical_min": 35.0
-        }
+        },
+        "irrelevant_phrases": [
+            "foot rest", "footrest", "airplane foot", "drone", "car rooftop", "rooftop cargo",
+            "travel adapter", "power adapter", "plug adapter", "passport holder", "passport cover",
+            "passport wallet", "neck pillow", "travel pillow", "sleep mask", "laptop sleeve",
+            "shoe bag", "shoe bags", "cable organizer", "electronics organizer", "door lock for hotel",
+            "hotel door lock", "door lock", "roof luggage"
+        ]
     },
 
     "migraine relief cap": {

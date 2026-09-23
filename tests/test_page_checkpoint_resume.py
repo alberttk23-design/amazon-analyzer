@@ -55,3 +55,44 @@ def test_page_checkpoint_and_stale_reclamation():
     # Queue should now be empty for this niche
     finished = db.get_next_pending_query(niche)
     assert finished is None
+
+
+def test_page_failure_checkpoint_preserves_failed_page():
+    """When a page fails (CAPTCHA, 503, etc.), next_page must stay on failed page to retry."""
+    db.init_db()
+    unique_suffix = uuid.uuid4().hex[:6].upper()
+    niche = f"FailCheck_Niche_{unique_suffix}"
+    test_query = f"fail query test {unique_suffix}"
+
+    # 1. Enqueue query with 3 target pages
+    db.enqueue_discovery_queries(niche=niche, queries=[test_query], target_pages=3)
+
+    # 2. Page 1 succeeds
+    db.update_query_progress(niche=niche, query=test_query, page_num=1, status="in_progress", success=True)
+    
+    conn = db.get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT last_completed_page, next_page, status, retry_count FROM discovery_query_queue WHERE niche=? AND query=?", (niche, test_query))
+    row = dict(cur.fetchone())
+    conn.close()
+
+    assert row["last_completed_page"] == 1
+    assert row["next_page"] == 2
+    assert row["status"] == "in_progress"
+
+    # 3. Page 2 fails with CAPTCHA or error
+    db.update_query_progress(niche=niche, query=test_query, page_num=2, status="failed", error="empty_or_captcha", success=False)
+
+    conn = db.get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT last_completed_page, next_page, status, retry_count, last_error FROM discovery_query_queue WHERE niche=? AND query=?", (niche, test_query))
+    row_failed = dict(cur.fetchone())
+    conn.close()
+
+    # Crucial assertion: failed page must NOT advance last_completed_page or next_page!
+    assert row_failed["last_completed_page"] == 1
+    assert row_failed["next_page"] == 2, "next_page must remain 2 so retry hits the failed page, not 3!"
+    assert row_failed["retry_count"] >= 1
+    assert row_failed["status"] == "failed"
+    assert "captcha" in row_failed["last_error"]
+

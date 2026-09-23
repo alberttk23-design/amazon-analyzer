@@ -30,7 +30,7 @@ def calculate_product_promotion_signals(product: Dict[str, Any], niche: Optional
     asin = product.get("asin", "")
     niche_name = niche or product.get("keyword") or product.get("niche") or ""
     price = float(product.get("price") or 0.0)
-    orig_price = float(product.get("original_price") or price)
+    orig_price = float(product.get("original_price") or 0.0)
     rating = float(product.get("rating") or 0.0)
     sales = int(product.get("bought_past_month") or 0)
     rev_velocity = float(product.get("review_velocity") or 0.0)

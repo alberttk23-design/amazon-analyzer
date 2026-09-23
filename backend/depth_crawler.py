@@ -433,7 +433,7 @@ def scrape_amazon_product_detail_and_variations(
             }""")
 
             price = parse_detail_price(data.get("priceText", ""))
-            original_price = parse_detail_price(data.get("origText", "")) or price
+            original_price = parse_detail_price(data.get("origText", "")) or 0.0
 
             # Resolve Parent vs Child identity
             parent_asin = data.get("parentAsin") or (asin if data.get("childAsins") else "")

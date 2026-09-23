@@ -1,0 +1,356 @@
+{
+  "timestamp": "20260923_145726",
+  "niche": "luggage",
+  "total_candidates": 591,
+  "relevance_breakdown": {
+    "CORE": 390,
+    "UNKNOWN": 154,
+    "ADJACENT": 35,
+    "ACCESSORY": 12
+  },
+  "price_stats": {
+    "overall_avg_price": 153.46,
+    "core_avg_price": 148.97,
+    "acc_avg_price": 38.28,
+    "adj_avg_price": 100.14
+  },
+  "clusters_count": 10,
+  "clusters": [
+    {
+      "sub_cluster": "duffel bags",
+      "relevance_class": "ADJACENT",
+      "product_count": 31,
+      "avg_price": 101.0,
+      "min_price": 16.25,
+      "max_price": 400.0,
+      "total_reviews": 69645,
+      "avg_rating": 4.3,
+      "total_monthly_sales": 7000,
+      "unique_brands": 26,
+      "top_brands": [
+        "Samsonite",
+        "Pelican",
+        "Goloni",
+        "Finnhomy",
+        "You pay $94.99"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "Samsonite",
+          "count": 2
+        },
+        {
+          "brand": "Pelican",
+          "count": 2
+        },
+        {
+          "brand": "Goloni",
+          "count": 2
+        },
+        {
+          "brand": "Finnhomy",
+          "count": 2
+        },
+        {
+          "brand": "You pay $94.99",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "luggage covers",
+      "relevance_class": "ACCESSORY",
+      "product_count": 5,
+      "avg_price": 21.59,
+      "min_price": 18.99,
+      "max_price": 23.99,
+      "total_reviews": 25652,
+      "avg_rating": 4.2,
+      "total_monthly_sales": 600,
+      "unique_brands": 5,
+      "top_brands": [
+        "Yotako",
+        "TRAVELKIN more than travel",
+        "Premium",
+        "JZRSuitcase",
+        "Explore Land"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "Yotako",
+          "count": 1
+        },
+        {
+          "brand": "TRAVELKIN more than travel",
+          "count": 1
+        },
+        {
+          "brand": "Premium",
+          "count": 1
+        },
+        {
+          "brand": "JZRSuitcase",
+          "count": 1
+        },
+        {
+          "brand": "Explore Land",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "packing cubes",
+      "relevance_class": "ACCESSORY",
+      "product_count": 3,
+      "avg_price": 53.32,
+      "min_price": 29.99,
+      "max_price": 89.98,
+      "total_reviews": 21758,
+      "avg_rating": 4.6,
+      "total_monthly_sales": 8250,
+      "unique_brands": 2,
+      "top_brands": [
+        "OlarHike",
+        "with 2 Pcs Packing Cubes, 360° Silent Spinner Wheels, Front Laptop Compartment Softside Travel Carry-on Luggage fit Overhead"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "OlarHike",
+          "count": 2
+        },
+        {
+          "brand": "with 2 Pcs Packing Cubes, 360° Silent Spinner Wheels, Front Laptop Compartment Softside Travel Carry-on Luggage fit Overhead",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "travel backpacks",
+      "relevance_class": "ADJACENT",
+      "product_count": 2,
+      "avg_price": 59.99,
+      "min_price": 20.99,
+      "max_price": 99.0,
+      "total_reviews": 58500,
+      "avg_rating": 4.7,
+      "total_monthly_sales": 10400,
+      "unique_brands": 2,
+      "top_brands": [
+        "Taygeer",
+        "SwissGear"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "Taygeer",
+          "count": 1
+        },
+        {
+          "brand": "SwissGear",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "accessories",
+      "relevance_class": "ACCESSORY",
+      "product_count": 1,
+      "avg_price": 18.99,
+      "min_price": 18.99,
+      "max_price": 18.99,
+      "total_reviews": 137,
+      "avg_rating": 4.1,
+      "total_monthly_sales": 0,
+      "unique_brands": 1,
+      "top_brands": [
+        "Anti-Scratch & Dirt-Proof Elastic Spandex Suitcase Cover, Washable, Dustproof, Travel Protector"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "Anti-Scratch & Dirt-Proof Elastic Spandex Suitcase Cover, Washable, Dustproof, Travel Protector",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "garment bags",
+      "relevance_class": "ADJACENT",
+      "product_count": 1,
+      "avg_price": 69.75,
+      "min_price": 69.75,
+      "max_price": 69.75,
+      "total_reviews": 10600,
+      "avg_rating": 4.6,
+      "total_monthly_sales": 1000,
+      "unique_brands": 1,
+      "top_brands": [
+        "ZEGUR"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "ZEGUR",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "luggage locks",
+      "relevance_class": "ACCESSORY",
+      "product_count": 1,
+      "avg_price": 157.99,
+      "min_price": 157.99,
+      "max_price": 157.99,
+      "total_reviews": 487,
+      "avg_rating": 4.2,
+      "total_monthly_sales": 0,
+      "unique_brands": 1,
+      "top_brands": [
+        "SwissGear"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "SwissGear",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "replacement parts",
+      "relevance_class": "ACCESSORY",
+      "product_count": 1,
+      "avg_price": 5.99,
+      "min_price": 5.99,
+      "max_price": 5.99,
+      "total_reviews": 96,
+      "avg_rating": 4.4,
+      "total_monthly_sales": 200,
+      "unique_brands": 1,
+      "top_brands": [
+        "Aorotost"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "Aorotost",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "scales",
+      "relevance_class": "ACCESSORY",
+      "product_count": 1,
+      "avg_price": 8.49,
+      "min_price": 8.49,
+      "max_price": 8.49,
+      "total_reviews": 22000,
+      "avg_rating": 4.7,
+      "total_monthly_sales": 20000,
+      "unique_brands": 1,
+      "top_brands": [
+        "travel inspira"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "travel inspira",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "sub_cluster": "tote bags",
+      "relevance_class": "ADJACENT",
+      "product_count": 1,
+      "avg_price": 183.95,
+      "min_price": 183.95,
+      "max_price": 183.95,
+      "total_reviews": 12500,
+      "avg_rating": 4.4,
+      "total_monthly_sales": 0,
+      "unique_brands": 1,
+      "top_brands": [
+        "Travelpro"
+      ],
+      "top_brands_detailed": [
+        {
+          "brand": "Travelpro",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "ground_truth_benchmark": {
+    "sample_size": 100,
+    "accuracy_pct": 100.0,
+    "false_core_rate_pct": 0.0,
+    "false_accessory_rate_pct": 0.0,
+    "confusion_matrix": {
+      "CORE": {
+        "CORE": 40,
+        "ADJACENT": 0,
+        "ACCESSORY": 0,
+        "IRRELEVANT": 0,
+        "UNKNOWN": 0
+      },
+      "ADJACENT": {
+        "CORE": 0,
+        "ADJACENT": 20,
+        "ACCESSORY": 0,
+        "IRRELEVANT": 0,
+        "UNKNOWN": 0
+      },
+      "ACCESSORY": {
+        "CORE": 0,
+        "ADJACENT": 0,
+        "ACCESSORY": 25,
+        "IRRELEVANT": 0,
+        "UNKNOWN": 0
+      },
+      "IRRELEVANT": {
+        "CORE": 0,
+        "ADJACENT": 0,
+        "ACCESSORY": 0,
+        "IRRELEVANT": 10,
+        "UNKNOWN": 0
+      },
+      "UNKNOWN": {
+        "CORE": 0,
+        "ADJACENT": 0,
+        "ACCESSORY": 0,
+        "IRRELEVANT": 0,
+        "UNKNOWN": 5
+      }
+    },
+    "class_metrics": {
+      "CORE": {
+        "precision": 100.0,
+        "recall": 100.0,
+        "f1": 100.0,
+        "support": 40
+      },
+      "ADJACENT": {
+        "precision": 100.0,
+        "recall": 100.0,
+        "f1": 100.0,
+        "support": 20
+      },
+      "ACCESSORY": {
+        "precision": 100.0,
+        "recall": 100.0,
+        "f1": 100.0,
+        "support": 25
+      },
+      "IRRELEVANT": {
+        "precision": 100.0,
+        "recall": 100.0,
+        "f1": 100.0,
+        "support": 10
+      },
+      "UNKNOWN": {
+        "precision": 100.0,
+        "recall": 100.0,
+        "f1": 100.0,
+        "support": 5
+      }
+    }
+  },
+  "total_time_seconds": 35.33
+}

@@ -97,7 +97,13 @@ def init_db():
         ("reviews_collected", "INTEGER DEFAULT 0"),
         ("collection_method", "TEXT DEFAULT 'tiered_sample'"),
         ("review_coverage", "TEXT DEFAULT 'unknown'"),
-        ("filters_applied", "TEXT DEFAULT ''")
+        ("filters_applied", "TEXT DEFAULT ''"),
+        ("critical_visible_reviews", "INTEGER DEFAULT 0"),
+        ("positive_visible_reviews", "INTEGER DEFAULT 0"),
+        ("critical_reviews_collected", "INTEGER DEFAULT 0"),
+        ("positive_reviews_collected", "INTEGER DEFAULT 0"),
+        ("collection_policy_status", "TEXT DEFAULT 'NONE'"),
+        ("review_corpus_coverage", "TEXT DEFAULT 'NONE'")
     ]
     for col_name, col_def in new_cols:
         if col_name not in existing_cols:
@@ -634,7 +640,7 @@ def save_product(p: Dict[str, Any], record_snapshot: bool = True) -> bool:
             "brand": p.get("brand") or "",
             "seller": p.get("seller") or "",
             "price": new_price,
-            "original_price": float(p.get("original_price") or new_price),
+            "original_price": float(p.get("original_price") or 0.0),
             "currency": p.get("currency") or "USD",
             "rating": float(p.get("rating") or 0.0),
             "reviews_count": new_revs,
@@ -765,15 +771,6 @@ def update_product_tier(asin: str, new_tier: str, reason: str = "", promotion_sc
     conn = get_db()
     cursor = conn.cursor()
     try:
-        sql = "UPDATE products SET tier = ?, tier_reason = ?, updated_at = CURRENT_TIMESTAMP"
-        params = [new_tier, reason]
-        if promotion_score is not None:
-            sql += ", promotion_score = ?"
-            params.append(promotion_score)
-        sql += " WHERE asin = ?"
-        params.append(asin)
-        cursor.execute(sql, tuple(params))
-
         if niche:
             n_sql = "UPDATE niche_products SET tier = ?, tier_reason = ?, updated_at = CURRENT_TIMESTAMP"
             n_params = [new_tier, reason]
@@ -783,6 +780,15 @@ def update_product_tier(asin: str, new_tier: str, reason: str = "", promotion_sc
             n_sql += " WHERE asin = ? AND niche = ?"
             n_params.extend([asin, niche])
             cursor.execute(n_sql, tuple(n_params))
+        else:
+            sql = "UPDATE products SET tier = ?, tier_reason = ?, updated_at = CURRENT_TIMESTAMP"
+            params = [new_tier, reason]
+            if promotion_score is not None:
+                sql += ", promotion_score = ?"
+                params.append(promotion_score)
+            sql += " WHERE asin = ?"
+            params.append(asin)
+            cursor.execute(sql, tuple(params))
 
         conn.commit()
         return True
@@ -1234,7 +1240,11 @@ def save_reviews(
     reviews_list: List[Dict[str, Any]],
     visible_total_reviews: int = 0,
     collection_method: str = "representative_polarity",
-    filters_applied: Optional[List[str]] = None
+    filters_applied: Optional[List[str]] = None,
+    critical_visible_reviews: int = 0,
+    positive_visible_reviews: int = 0,
+    critical_collected: int = 0,
+    positive_collected: int = 0
 ) -> int:
     conn = get_db()
     cursor = conn.cursor()
@@ -1279,20 +1289,37 @@ def save_reviews(
 
     # Update Review Collection Policy coverage metadata in products table
     if saved > 0 or len(reviews_list) > 0:
-        cursor.execute("SELECT reviews_count FROM products WHERE asin = ?", (asin,))
+        cursor.execute("SELECT reviews_count, visible_total_reviews FROM products WHERE asin = ?", (asin,))
         p_row = cursor.fetchone()
-        vt = visible_total_reviews or (p_row["reviews_count"] if p_row else 0) or len(reviews_list)
+        canonical_count = p_row["reviews_count"] if p_row else 0
+        existing_vt = p_row["visible_total_reviews"] if p_row else 0
+        # Preserve true total product reviews; never let filtered critical/positive counts overwrite overall total
+        vt = canonical_count or existing_vt or visible_total_reviews or len(reviews_list)
         coverage_pct = round((len(reviews_list) / max(1, vt)) * 100, 2)
         coverage_str = f"{len(reviews_list)}/{vt} ({coverage_pct}%)"
         filters_str = json.dumps(filters_applied or ["critical_1_3_star", "positive_5_star"])
         
         target_map = {"discovery_sample": 10, "representative_polarity": 30, "deep_hot_crawl": 60}
         target_for_policy = target_map.get(collection_method, 30)
+
+        # 1. Collection Policy Status: was the sample target satisfied?
         if len(reviews_list) >= target_for_policy or (vt > 0 and len(reviews_list) >= vt):
+            policy_status = "COMPLETE"
+        elif len(reviews_list) > 0:
+            policy_status = "PARTIAL"
+        else:
+            policy_status = "NONE"
+
+        # 2. Review Corpus Coverage: is the whole product corpus crawled?
+        # Never report FULL when 60 reviews collected on a 5000-review product!
+        if vt > 0 and len(reviews_list) >= vt:
+            corpus_coverage = "FULL"
             depth_status = "FULL"
         elif len(reviews_list) > 0:
+            corpus_coverage = "PARTIAL"
             depth_status = "PARTIAL"
         else:
+            corpus_coverage = "NONE"
             depth_status = "NONE"
 
         cursor.execute("""
@@ -1303,10 +1330,23 @@ def save_reviews(
             review_coverage = ?,
             filters_applied = ?,
             review_depth = ?,
+            critical_visible_reviews = CASE WHEN ? > 0 THEN ? ELSE critical_visible_reviews END,
+            positive_visible_reviews = CASE WHEN ? > 0 THEN ? ELSE positive_visible_reviews END,
+            critical_reviews_collected = CASE WHEN ? > 0 THEN ? ELSE critical_reviews_collected END,
+            positive_reviews_collected = CASE WHEN ? > 0 THEN ? ELSE positive_reviews_collected END,
+            collection_policy_status = ?,
+            review_corpus_coverage = ?,
             tier = 'HOT',
             updated_at = CURRENT_TIMESTAMP
         WHERE asin = ?
-        """, (vt, len(reviews_list), collection_method, coverage_str, filters_str, depth_status, asin))
+        """, (
+            vt, len(reviews_list), collection_method, coverage_str, filters_str, depth_status,
+            critical_visible_reviews, critical_visible_reviews,
+            positive_visible_reviews, positive_visible_reviews,
+            critical_collected, critical_collected,
+            positive_collected, positive_collected,
+            policy_status, corpus_coverage, asin
+        ))
 
     conn.commit()
     conn.close()
@@ -2230,19 +2270,38 @@ def get_next_pending_query(niche: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def update_query_progress(niche: str, query: str, page_num: int, status: str = 'in_progress', error: str = '') -> bool:
+def update_query_progress(
+    niche: str,
+    query: str,
+    page_num: int,
+    status: str = 'in_progress',
+    error: str = '',
+    success: bool = True
+) -> bool:
     """Update page-level progress in discovery_query_queue for exact recovery."""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-    UPDATE discovery_query_queue
-    SET status = ?,
-        last_completed_page = ?,
-        next_page = ?,
-        last_error = ?,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE niche = ? AND query = ?
-    """, (status, page_num, page_num + 1, error, niche, query))
+    if success and status not in ('failed', 'error', 'captcha'):
+        cursor.execute("""
+        UPDATE discovery_query_queue
+        SET status = ?,
+            last_completed_page = ?,
+            next_page = ?,
+            last_error = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE niche = ? AND query = ?
+        """, (status, page_num, page_num + 1, error, niche, query))
+    else:
+        cursor.execute("""
+        UPDATE discovery_query_queue
+        SET status = ?,
+            last_completed_page = CASE WHEN last_completed_page >= ? THEN last_completed_page ELSE max(0, ? - 1) END,
+            next_page = ?,
+            retry_count = retry_count + 1,
+            last_error = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE niche = ? AND query = ?
+        """, (status, page_num, page_num, page_num, error, niche, query))
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()

@@ -184,7 +184,8 @@ def crawl_amazon_reviews_for_asin(
         return page_reviews, visible_count
 
     def execute_with_page(page):
-        total_visible_found = 0
+        critical_visible_found = 0
+        positive_visible_found = 0
 
         # 1. Critical Reviews (1-3 stars)
         crit_reviews = []
@@ -195,8 +196,8 @@ def crawl_amazon_reviews_for_asin(
                 break
             crit_url = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=critical&pageNumber={p_num}&sortBy=recent"
             page_revs, vis_count = scrape_review_page(page, crit_url, "critical")
-            if vis_count and not total_visible_found:
-                total_visible_found = vis_count
+            if vis_count and not critical_visible_found:
+                critical_visible_found = vis_count
             new_added = 0
             for r in page_revs:
                 if r["review_id"] not in seen_crit_ids:
@@ -218,8 +219,8 @@ def crawl_amazon_reviews_for_asin(
                 break
             pos_url = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=positive&pageNumber={p_num}&sortBy=helpful"
             page_revs, vis_count = scrape_review_page(page, pos_url, "positive")
-            if vis_count and not total_visible_found:
-                total_visible_found = vis_count
+            if vis_count and not positive_visible_found:
+                positive_visible_found = vis_count
             new_added = 0
             for r in page_revs:
                 if r["review_id"] not in seen_pos_ids:
@@ -232,11 +233,13 @@ def crawl_amazon_reviews_for_asin(
                 break
             time.sleep(random.uniform(0.3, 0.6))
 
-        all_collected = crit_reviews[:target_crit] + pos_reviews[:target_pos]
-        return all_collected, total_visible_found
+        final_crit = crit_reviews[:target_crit]
+        final_pos = pos_reviews[:target_pos]
+        all_collected = final_crit + final_pos
+        return all_collected, critical_visible_found, positive_visible_found, len(final_crit), len(final_pos)
 
     if page_handle:
-        collected, total_visible = execute_with_page(page_handle)
+        collected, crit_vis, pos_vis, crit_cnt, pos_cnt = execute_with_page(page_handle)
     else:
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
@@ -247,7 +250,7 @@ def crawl_amazon_reviews_for_asin(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
             )
             page = context.pages[0] if context.pages else context.new_page()
-            collected, total_visible = execute_with_page(page)
+            collected, crit_vis, pos_vis, crit_cnt, pos_cnt = execute_with_page(page)
             context.close()
 
     # Save to SQLite with Review Collection Policy provenance metadata
@@ -255,11 +258,14 @@ def crawl_amazon_reviews_for_asin(
         asin=asin,
         keyword=keyword,
         reviews_list=collected,
-        visible_total_reviews=total_visible,
         collection_method=policy_tier,
-        filters_applied=["critical_1_3_star", "positive_5_star"]
+        filters_applied=["critical_1_3_star", "positive_5_star"],
+        critical_visible_reviews=crit_vis,
+        positive_visible_reviews=pos_vis,
+        critical_collected=crit_cnt,
+        positive_collected=pos_cnt
     )
-    print(f"[ReviewCrawler] ASIN {asin} ({policy_tier}): Collected {len(collected)} reviews ({saved_count} saved, {total_visible} visible total).")
+    print(f"[ReviewCrawler] ASIN {asin} ({policy_tier}): Collected {len(collected)} reviews ({saved_count} saved, crit_vis: {crit_vis}, pos_vis: {pos_vis}).")
     return collected
 
 

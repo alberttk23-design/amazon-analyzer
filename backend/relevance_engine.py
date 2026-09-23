@@ -86,6 +86,18 @@ def classify_product(
             evidence.append(f"embedded_feature={feat}")
             neutralized_title = neutralized_title.replace(feat, f" [feat_{feat.replace(' ', '_')}] ")
 
+    # Contextual Feature Neutralization: When title represents a primary suitcase or set,
+    # trailing or embedded feature mentions (e.g. "TSA lock", "spinner wheels") belong to the suitcase.
+    has_suitcase_marker = any(w in neutralized_title for w in ["suitcase", "luggage set", "piece set", "piece luggage", "piece suitcase", "carry-on spinner", "carry on spinner"])
+    has_relational = any(rg in clean_t for rg in ["for suitcase", "for luggage", "replacement for", "fits 20-28"])
+    if has_suitcase_marker and not has_relational:
+        tsa_m = re.search(r'\b(?:(?:with|w/|lightweight|integrated|built-in)\s+)?tsa(?:\s+approved)?\s+lock\b', neutralized_title, flags=re.IGNORECASE)
+        if tsa_m:
+            matched_tsa = tsa_m.group(0).strip().lower()
+            embedded_features.append(matched_tsa)
+            evidence.append(f"embedded_feature={matched_tsa}")
+            neutralized_title = re.sub(r'\b(?:(?:with|w/|lightweight|integrated|built-in)\s+)?tsa(?:\s+approved)?\s+lock\b', " [feat] ", neutralized_title, flags=re.IGNORECASE)
+
     # 2. Check ACCESSORY Patterns
     matched_accessory_cluster = None
     matched_accessory_phrase = None
@@ -104,12 +116,31 @@ def classify_product(
 
     # Also check relational accessory guards (e.g. "for suitcase", "replacement for")
     is_relational_accessory = False
+    has_adjacent_bag = any(w in clean_t for w in ["duffel", "duffle", "backpack", "garment bag", "tote bag", "weekender"])
     for rel_guard in config.get("relational_accessory_guards", []):
-        if rel_guard in clean_t:
+        is_match = False
+        if any(tok in rel_guard for tok in [r"(?:", r"\s", r"|", r"[", r"]"]):
+            if re.search(rel_guard, clean_t, flags=re.IGNORECASE):
+                is_match = True
+        elif rel_guard.lower() in clean_t:
+            is_match = True
+
+        if is_match and not (has_adjacent_bag and rel_guard in ["for luggage", "for suitcase", "for carry-on"]):
             is_relational_accessory = True
             evidence.append(f"relational_accessory_guard={rel_guard}")
             if not matched_accessory_cluster:
-                matched_accessory_cluster = "replacement parts" if "replacement" in rel_guard else "accessories"
+                if "lock" in rel_guard:
+                    matched_accessory_cluster = "luggage locks"
+                elif "tag" in rel_guard:
+                    matched_accessory_cluster = "luggage tags"
+                elif "wheel" in rel_guard or "replacement" in rel_guard:
+                    matched_accessory_cluster = "replacement parts"
+                elif "scale" in rel_guard:
+                    matched_accessory_cluster = "scales"
+                elif "strap" in rel_guard:
+                    matched_accessory_cluster = "straps"
+                else:
+                    matched_accessory_cluster = "accessories"
             break
 
     if matched_accessory_cluster:
@@ -132,6 +163,44 @@ def classify_product(
             "relevance_confidence": min(0.99, round(conf, 2)),
             "relevance_evidence": evidence,
             "sub_cluster": matched_accessory_cluster,
+            "rule_version": RULE_VERSION
+        }
+
+    # Check for Strong Core Suitcase / Set signals (e.g. "3 Piece Luggage Set with Duffel Bag" is CORE, not ADJACENT)
+    strong_core_tokens = [
+        "luggage set", "suitcase set", "piece luggage set", "piece suitcase set", "piece set",
+        "carry-on suitcase", "carry on suitcase", "checked suitcase", "spinner suitcase",
+        "hardside luggage", "hardside suitcase", "rolling suitcase", "carry-on spinner", "carry on spinner"
+    ]
+    for sct in strong_core_tokens:
+        if re.search(r'(?:\b|^)' + re.escape(sct) + r'(?:\b|$)', clean_t):
+            evidence.append(f"strong_core_phrase={sct}")
+            conf = 0.95
+            if embedded_features:
+                conf += 0.03
+                evidence.append("embedded_features_reinforce_core")
+            return {
+                "relevance_class": "CORE",
+                "relevance_confidence": min(0.99, round(conf, 2)),
+                "relevance_evidence": evidence,
+                "sub_cluster": "",
+                "rule_version": RULE_VERSION
+            }
+
+    # Check for Out-of-Scope / IRRELEVANT markers before generic single-word core match
+    matched_irrelevant = None
+    for irr_phrase in config.get("irrelevant_phrases", []):
+        if re.search(r'(?:\b|^)' + re.escape(irr_phrase) + r'(?:\b|$)', clean_t):
+            matched_irrelevant = irr_phrase
+            evidence.append(f"irrelevant_phrase={irr_phrase}")
+            break
+
+    if matched_irrelevant and not has_suitcase_marker:
+        return {
+            "relevance_class": "IRRELEVANT",
+            "relevance_confidence": 0.95,
+            "relevance_evidence": evidence,
+            "sub_cluster": "irrelevant",
             "rule_version": RULE_VERSION
         }
 
@@ -198,7 +267,24 @@ def classify_product(
             "rule_version": RULE_VERSION
         }
 
-    # 5. Fallback UNKNOWN (Insufficient evidence or conflict)
+    # 5. Check IRRELEVANT Patterns (explicit out-of-scope products)
+    matched_irrelevant = None
+    for irr_phrase in config.get("irrelevant_phrases", []):
+        if re.search(r'(?:\b|^)' + re.escape(irr_phrase) + r'(?:\b|$)', clean_t):
+            matched_irrelevant = irr_phrase
+            evidence.append(f"irrelevant_phrase={irr_phrase}")
+            break
+
+    if matched_irrelevant:
+        return {
+            "relevance_class": "IRRELEVANT",
+            "relevance_confidence": 0.92,
+            "relevance_evidence": evidence,
+            "sub_cluster": "irrelevant",
+            "rule_version": RULE_VERSION
+        }
+
+    # 6. Fallback UNKNOWN (Insufficient evidence or conflict)
     return {
         "relevance_class": "UNKNOWN",
         "relevance_confidence": 0.0,

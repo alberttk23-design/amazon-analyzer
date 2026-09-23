@@ -59,3 +59,27 @@ def test_parse_visible_review_count():
     assert parse_visible_review_count("Showing 1-10 of 3,890 global reviews") == 3890
     assert parse_visible_review_count("520 total ratings, 88 with reviews") == 88
     assert parse_visible_review_count("1,500 total ratings") == 1500
+
+
+def test_extract_cheap_products_no_fake_brand_or_price_invention():
+    from backend.breadth_crawler import extract_cheap_products_from_html
+    
+    # HTML card with no brand element, unobserved strike price, and real data-csa-c-product-type="SUITCASE"
+    html = """
+    <div data-component-type="s-search-result" data-asin="B00EXAMPLE">
+        <h2><span>Expandable Carry On Luggage 20 Inch</span></h2>
+        <a href="/dp/B00EXAMPLE">Link</a>
+        <div class="a-price"><span class="a-offscreen">$99.99</span></div>
+        <div data-csa-c-product-type="SUITCASE"></div>
+    </div>
+    """
+    prods, obs = extract_cheap_products_from_html(html, query="luggage", lane="keyword_search", niche="luggage", page=1)
+    assert len(prods) == 1
+    p = prods[0]
+    assert p["asin"] == "B00EXAMPLE"
+    assert p["price"] == 99.99
+    # Crucial Data Truth assertions:
+    assert p["original_price"] == 0.0, "Missing strike price must remain 0.0, never invent 99.99!"
+    assert p["brand"] == "", "Must NEVER invent brand 'Expandable' from first word of title!"
+    assert p["bsr_category"] == "Suitcase", "Must extract real Amazon product-type, never fake bsr_category = niche!"
+
