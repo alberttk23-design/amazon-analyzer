@@ -2458,6 +2458,62 @@ def reclaim_stale_in_progress_queries(niche: str, timeout_minutes: int = 15) -> 
     return reclaimed
 
 
+def resume_partition_after_user_action(
+    niche: str,
+    query: Optional[str] = None,
+    partition_id: Optional[str] = None
+) -> int:
+    """
+    Explicitly transitions queries from 'paused_captcha' or interrupted 'in_progress'
+    back to 'pending' state after user action (e.g. solving CAPTCHA or resetting session).
+    Crucially PRESERVES last_completed_page and next_page so the crawler resumes exactly
+    at the page where it paused.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    where = "WHERE niche = ? AND status IN ('paused_captcha', 'in_progress')"
+    params = [niche]
+    if query:
+        where += " AND query = ?"
+        params.append(query)
+    if partition_id:
+        where += " AND partition_id = ?"
+        params.append(partition_id)
+
+    sql = f"""
+    UPDATE discovery_query_queue
+    SET status = 'pending',
+        last_error = 'resumed_after_user_action',
+        updated_at = CURRENT_TIMESTAMP
+    {where}
+    """
+    cursor.execute(sql, params)
+    reclaimed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return reclaimed
+
+
+def get_observed_prices_for_niche(niche: str) -> List[float]:
+    """Retrieve non-zero observed prices for a niche to feed dynamic percentile buckets."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT price FROM search_observations
+    WHERE niche = ? AND price > 0.0
+    """, (niche,))
+    prices = [float(r[0]) for r in cursor.fetchall() if r[0] and float(r[0]) > 0.0]
+    if not prices:
+        cursor.execute("""
+        SELECT p.price FROM products p
+        JOIN niche_products np ON p.asin = np.asin
+        WHERE np.niche = ? AND p.price > 0.0
+        """, (niche,))
+        prices = [float(r[0]) for r in cursor.fetchall() if r[0] and float(r[0]) > 0.0]
+    conn.close()
+    return prices
+
+
 def get_query_queue_checkpoint(niche: str) -> Dict[str, Any]:
     conn = get_db()
     cursor = conn.cursor()
@@ -2467,6 +2523,7 @@ def get_query_queue_checkpoint(niche: str) -> Dict[str, Any]:
         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_queries,
         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_queries,
         SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_queries,
+        SUM(CASE WHEN status = 'paused_captcha' THEN 1 ELSE 0 END) as paused_captcha_queries,
         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_queries,
         SUM(CASE WHEN status = 'saturated' THEN 1 ELSE 0 END) as saturated_queries
     FROM discovery_query_queue
@@ -2483,6 +2540,7 @@ def get_query_queue_checkpoint(niche: str) -> Dict[str, Any]:
         "completed_queries": comp,
         "pending_queries": r.get("pending_queries") or 0,
         "in_progress_queries": r.get("in_progress_queries") or 0,
+        "paused_captcha_queries": r.get("paused_captcha_queries") or 0,
         "failed_queries": r.get("failed_queries") or 0,
         "saturated_queries": r.get("saturated_queries") or 0,
         "progress_percent": round((comp / total * 100), 1) if total > 0 else 0.0

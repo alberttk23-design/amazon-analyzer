@@ -608,21 +608,26 @@ def run_breadth_discovery_saturation_loop(
     lanes = expand_niche_lanes(seed_keyword)
     queue_entries: List[Any] = []
 
-    for q in lanes.get("keyword_search", []):
-        queue_entries.append(("keyword_search", q, 1))
-    for q in lanes.get("suggestions", []):
-        queue_entries.append(("suggestions", q, 2))
-    for q in lanes.get("intent_modifiers", []):
-        queue_entries.append(("intent_modifiers", q, 3))
+    # Primary Seed Query (Normal, ALL) - Priority 1, executes first
+    queue_entries.append({
+        "lane": "keyword_search",
+        "query": seed_keyword,
+        "priority": 1,
+        "target_pages": max_pages_per_query,
+        "partition_type": "NORMAL",
+        "partition_id": "ALL"
+    })
 
-    # Optional: Semantic Price Partitioning (Price Slicing)
+    # Optional: Semantic Price Partitioning (Price Slicing) for seed query - Priority 1
+    # When enabled, price slices run immediately after the normal seed query, BEFORE secondary keywords!
     if enable_price_partition:
-        semantic_buckets = taxonomy_registry.get_semantic_price_buckets(niche, query=seed_keyword)
+        observed_prices = db.get_observed_prices_for_niche(niche)
+        semantic_buckets = taxonomy_registry.get_semantic_price_buckets(niche, query=seed_keyword, observed_prices=observed_prices)
         for bucket in semantic_buckets:
             queue_entries.append({
                 "lane": "price_partition",
                 "query": seed_keyword,
-                "priority": 2,
+                "priority": 1,
                 "target_pages": max_pages_per_query,
                 "partition_type": "PRICE",
                 "partition_id": bucket["partition_id"],
@@ -630,9 +635,29 @@ def run_breadth_discovery_saturation_loop(
                 "max_price": bucket["max_price"]
             })
 
+    # Secondary Keyword Search variants - Priority 2
+    for q in lanes.get("keyword_search", []):
+        if q.strip().lower() != seed_keyword.strip().lower():
+            queue_entries.append(("keyword_search", q, 2))
+
+    # Suggestions - Priority 3
+    for q in lanes.get("suggestions", []):
+        if q.strip().lower() != seed_keyword.strip().lower():
+            queue_entries.append(("suggestions", q, 3))
+
+    # Intent Modifiers - Priority 4
+    for q in lanes.get("intent_modifiers", []):
+        if q.strip().lower() != seed_keyword.strip().lower():
+            queue_entries.append(("intent_modifiers", q, 4))
+
     db.enqueue_discovery_queries(niche, queue_entries)
 
-    # 2. Reclaim any stale in_progress queries from crashes or interruptions
+    # 2. Checkpoint Resume & Stale Reclaim
+    if resume:
+        resumed = db.resume_partition_after_user_action(niche)
+        if resumed > 0:
+            logger.info(f"[BreadthCrawler] Resumed {resumed} paused/interrupted queries for '{niche}' back to 'pending'.")
+
     reclaimed = db.reclaim_stale_in_progress_queries(niche, timeout_minutes=15)
     if reclaimed > 0:
         logger.info(f"[BreadthCrawler] Reclaimed {reclaimed} stale in-progress queries for '{niche}'.")
@@ -849,6 +874,24 @@ def run_breadth_discovery_saturation_loop(
             learned_queries = extract_dynamic_query_candidates(seed_keyword, discovered_titles, max_tokens=3)
             learned_injections = [("adaptive_vocabulary", lq, 5) for lq in learned_queries]
             db.enqueue_discovery_queries(niche, learned_injections)
+
+        # Dynamically refine price buckets for unknown niches based on real observed prices from crawl
+        if enable_price_partition and queries_executed == 1 and not taxonomy_registry.get_taxonomy_config_for_niche(niche):
+            live_prices = db.get_observed_prices_for_niche(niche)
+            if len(live_prices) >= 12:
+                dynamic_buckets = taxonomy_registry.get_semantic_price_buckets(niche, query=seed_keyword, observed_prices=live_prices)
+                refined_entries = [{
+                    "lane": "price_partition",
+                    "query": seed_keyword,
+                    "priority": 1,
+                    "target_pages": max_pages_per_query,
+                    "partition_type": "PRICE",
+                    "partition_id": b["partition_id"],
+                    "min_price": b["min_price"],
+                    "max_price": b["max_price"]
+                } for b in dynamic_buckets]
+                db.enqueue_discovery_queries(niche, refined_entries)
+                logger.info(f"[BreadthCrawler] Dynamically enqueued {len(refined_entries)} calibrated price buckets based on {len(live_prices)} observed prices.")
 
         time.sleep(random.uniform(0.5, 1.2))
 

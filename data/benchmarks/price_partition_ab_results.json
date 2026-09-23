@@ -1,50 +1,74 @@
 {
-  "benchmark_id": "43e06d7c",
+  "benchmark_id": "fae690ac",
   "niche": "luggage",
-  "timestamp": "2026-09-23 15:50:36",
-  "arm_a_baseline": {
-    "total_asins": 272,
-    "core_asins": 253,
-    "accessory_asins": 4,
-    "adjacent_asins": 11,
-    "search_observations": 300,
-    "pages_requested": 6,
-    "runtime_seconds": 43.7
+  "timestamp": "2026-09-23 16:14:50",
+  "pages_per_slice": 1,
+  "baseline_normal": {
+    "query": "luggage",
+    "partition_id": "ALL",
+    "unique_asins": 60,
+    "observations": 60,
+    "runtime_seconds": 6.96
   },
-  "arm_b_partitioned": {
-    "total_asins": 589,
-    "core_asins": 516,
-    "accessory_asins": 15,
-    "adjacent_asins": 39,
-    "search_observations": 948,
-    "pages_requested": 18,
-    "runtime_seconds": 129.04,
-    "duplicate_rate_pct": 37.87,
+  "price_partitions_harvest": {
+    "total_slices_evaluated": 4,
     "slice_observations": {
-      "ALL": 948
+      "ALL": 60,
+      "PRICE_0_62": 48,
+      "PRICE_62_105": 48,
+      "PRICE_105_160": 48,
+      "PRICE_160_PLUS": 48
     },
-    "transports": {
-      "PLAYWRIGHT_PERSISTENT": 948
+    "slice_incremental_yield": {
+      "PRICE_0_62": {
+        "label": "Budget (<$62.99)",
+        "min_price": 0.0,
+        "max_price": 62.99,
+        "observations": 48,
+        "total_asins_in_slice": 48,
+        "net_new_unique_vs_baseline": 36,
+        "duplicate_with_baseline_count": 12
+      },
+      "PRICE_62_105": {
+        "label": "Entry ($62.99-$105.84)",
+        "min_price": 62.99,
+        "max_price": 105.84,
+        "observations": 48,
+        "total_asins_in_slice": 48,
+        "net_new_unique_vs_baseline": 40,
+        "duplicate_with_baseline_count": 8
+      },
+      "PRICE_105_160": {
+        "label": "Mid-Range ($105.84-$160.0)",
+        "min_price": 105.84,
+        "max_price": 160.0,
+        "observations": 48,
+        "total_asins_in_slice": 48,
+        "net_new_unique_vs_baseline": 34,
+        "duplicate_with_baseline_count": 14
+      },
+      "PRICE_160_PLUS": {
+        "label": "Premium (>$160.0)",
+        "min_price": 160.0,
+        "max_price": 0.0,
+        "observations": 48,
+        "total_asins_in_slice": 48,
+        "net_new_unique_vs_baseline": 34,
+        "duplicate_with_baseline_count": 14
+      }
     },
-    "sub_niche_clusters": [
-      "duffel bags",
-      "luggage covers",
-      "packing cubes",
-      "luggage locks",
-      "travel backpacks",
-      "garment bags",
-      "replacement parts",
-      "scales",
-      "tote bags"
-    ]
+    "total_partition_unique_asins": 191,
+    "runtime_seconds": 25.5
   },
-  "incremental_delta": {
-    "net_unique_asins_gained": 322,
-    "net_core_asins_gained": 268,
-    "net_accessory_asins_gained": 11,
-    "net_adjacent_asins_gained": 28,
-    "net_observations_gained": 648,
-    "core_lift_pct": 103.95,
-    "total_lift_pct": 116.54
+  "genuine_incremental_lift": {
+    "total_combined_unique_asins": 204,
+    "net_genuine_incremental_asins": 144,
+    "incremental_lift_pct": 240.0,
+    "core_asins_count": 181,
+    "accessory_asins_count": 3,
+    "adjacent_asins_count": 15
+  },
+  "transports_used": {
+    "PLAYWRIGHT_PERSISTENT": 252
   }
 }

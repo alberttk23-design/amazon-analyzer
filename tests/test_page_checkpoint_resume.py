@@ -96,3 +96,61 @@ def test_page_failure_checkpoint_preserves_failed_page():
     assert row_failed["status"] == "failed"
     assert "captcha" in row_failed["last_error"]
 
+
+def test_paused_captcha_to_resume_exact_page_end_to_end():
+    """Verify that a paused_captcha query is safely held, unpaused upon user action, and resumes on exact failed page."""
+    db.init_db()
+    unique_suffix = uuid.uuid4().hex[:6].upper()
+    niche = f"CaptchaResume_Niche_{unique_suffix}"
+    test_query = f"captcha test {unique_suffix}"
+
+    # 1. Enqueue query targeting 5 pages
+    db.enqueue_discovery_queries(niche=niche, queries=[test_query], target_pages=5)
+
+    # 2. Pages 1 and 2 complete successfully
+    db.update_query_progress(niche=niche, query=test_query, page_num=1, status="in_progress", success=True)
+    db.update_query_progress(niche=niche, query=test_query, page_num=2, status="in_progress", success=True)
+
+    # 3. Page 3 hits Amazon CAPTCHA -> crawler records page 3 failure and marks it paused_captcha
+    db.update_query_progress(
+        niche=niche,
+        query=test_query,
+        page_num=3,
+        status="paused_captcha",
+        error="Amazon Bot Check Captcha encountered",
+        success=False
+    )
+
+    # 4. Checkpoint records paused query
+    checkpoint = db.get_query_queue_checkpoint(niche)
+    assert checkpoint["paused_captcha_queries"] == 1
+
+    # 5. Normal queue fetch MUST NOT pick up paused_captcha query while waiting for user action!
+    item = db.get_next_pending_query(niche)
+    assert item is None, "A paused_captcha query must not be popped by workers before user action/resume!"
+
+    # 6. User resolves CAPTCHA / calls resume API
+    resumed_count = db.resume_partition_after_user_action(niche=niche, query=test_query)
+    assert resumed_count == 1, "Exactly 1 query should be transitioned back to pending"
+
+    # 7. Queue now pops the resumed query with EXACT failed page preserved
+    resumed_item = db.get_next_pending_query(niche)
+    assert resumed_item is not None
+    assert resumed_item["status"] == "pending"
+    assert resumed_item["last_completed_page"] == 2
+    assert resumed_item["next_page"] == 3, "Resumed query MUST restart at page 3, not page 1!"
+
+    # 8. Crawler simulates executing from next_page (page 3)
+    start_page = resumed_item["next_page"]
+    assert start_page == 3
+    db.update_query_progress(niche=niche, query=test_query, page_num=3, status="in_progress", success=True)
+    db.update_query_progress(niche=niche, query=test_query, page_num=4, status="in_progress", success=True)
+    db.update_query_progress(niche=niche, query=test_query, page_num=5, status="completed", success=True)
+
+    # Verify query is now completed
+    assert db.get_next_pending_query(niche) is None
+    final_checkpoint = db.get_query_queue_checkpoint(niche)
+    assert final_checkpoint["completed_queries"] == 1
+    assert final_checkpoint["paused_captcha_queries"] == 0
+
+

@@ -118,6 +118,8 @@ class ResumeCrawlRequest(BaseModel):
     niche: str
     max_queries: int = 20
     max_pages_per_query: int = 3
+    query: Optional[str] = None
+    partition_id: Optional[str] = None
 
 
 # ---------------------------------------------------------
@@ -319,8 +321,16 @@ def get_queue_status(keyword: Optional[str] = None, niche: Optional[str] = None)
 
 @app.post("/api/crawl/resume")
 def resume_crawl(req: ResumeCrawlRequest, bg_tasks: BackgroundTasks):
+    # Explicitly transition paused_captcha or interrupted queries back to pending
+    resumed = db.resume_partition_after_user_action(
+        niche=req.niche,
+        query=req.query,
+        partition_id=req.partition_id
+    )
+    session_info = session_manager.verify_session_usable()
+
     job_id = f"job_resume_{uuid.uuid4().hex[:8]}"
-    db.create_crawl_job(job_id, req.niche, f"Tiếp tục cào từ Checkpoint hàng đợi cho '{req.niche}'...")
+    db.create_crawl_job(job_id, req.niche, f"Tiếp tục cào từ Checkpoint hàng đợi cho '{req.niche}' ({resumed} queries resumed)...")
     bg_tasks.add_task(
         breadth_crawler.run_breadth_discovery_saturation_loop,
         seed_keyword=req.niche,
@@ -330,7 +340,13 @@ def resume_crawl(req: ResumeCrawlRequest, bg_tasks: BackgroundTasks):
         resume=True,
         job_id=job_id
     )
-    return {"job_id": job_id, "status": "resuming", "niche": req.niche}
+    return {
+        "job_id": job_id,
+        "status": "resuming",
+        "niche": req.niche,
+        "resumed_queries": resumed,
+        "session": session_info
+    }
 
 
 @app.get("/api/products/{asin}/variations")

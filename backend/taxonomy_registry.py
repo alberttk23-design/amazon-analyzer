@@ -235,7 +235,7 @@ def get_semantic_price_buckets(
     2. Otherwise, returns taxonomy configured default_price_buckets if present.
     3. Fallback: standard 4-tier e-commerce buckets ($0-$25, $25-$50, $50-$100, $100+).
     """
-    cfg = get_taxonomy_config_for_niche(niche)
+    cfg = get_taxonomy_config_for_niche(niche) or (get_taxonomy_config_for_niche(query) if query else None)
 
     # 1. Dynamic percentiles if enough sample prices observed
     valid_prices = [p for p in (observed_prices or []) if p > 0.0]

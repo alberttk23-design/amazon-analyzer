@@ -1,6 +1,7 @@
 """
-A/B Incremental Value Benchmark: Baseline Normal vs Baseline + Price Partitioning
-Compares coverage, core yield, accessory enrichment, duplicate rate, and observation intelligence.
+A/B Incremental Value Benchmark: Baseline Normal vs Price Partitioning
+Compares exact same query on Normal Search (ALL) vs Price Partitions (PRICE_0_25, PRICE_25_60, etc.)
+Calculates true net incremental unique ASIN yield per slice without secondary query contamination.
 Saves structured benchmark run data to data/benchmarks/price_partition_ab_results.json.
 """
 import argparse
@@ -12,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Dict, Any, Set, List
+from urllib.parse import quote
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
@@ -26,150 +28,218 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("benchmark.ab")
 
 
-def run_ab_benchmark(niche: str = "luggage", max_pages_per_query: int = 1, max_queries: int = 3) -> Dict[str, Any]:
+def run_ab_benchmark(niche: str = "luggage", pages_per_slice: int = 1) -> Dict[str, Any]:
     db.init_db()
     benchmark_id = str(uuid.uuid4())[:8]
-    logger.info(f"Starting A/B Incremental Benchmark for niche='{niche}' (id={benchmark_id})")
+    session_id = f"bench_{benchmark_id}"
+    bench_niche = f"{niche}_ab_bench_{benchmark_id}"
+    logger.info(f"Starting Rigorous Price Partition Benchmark for niche='{niche}' (id={benchmark_id})")
+
+    fetcher = breadth_crawler.StrategyLadderFetcher()
+    db.create_research_run(session_id, bench_niche)
 
     # -------------------------------------------------------------
-    # Arm A: Baseline (Normal Pagination only)
+    # PHASE A: Baseline Normal Search (ALL partition)
     # -------------------------------------------------------------
-    logger.info("\n=======================================================")
-    logger.info(">>> RUNNING ARM A: BASELINE (NORMAL PAGINATION ONLY) <<<")
-    logger.info("=======================================================")
-    arm_a_niche = f"{niche}_ab_baseline_{benchmark_id}"
+    logger.info("\n" + "=" * 65)
+    logger.info(">>> PHASE A: BASELINE NORMAL SEARCH (partition_id='ALL') <<<")
+    logger.info("=" * 65)
     t0_a = time.time()
-    res_a = breadth_crawler.run_breadth_discovery_saturation_loop(
-        seed_keyword=niche,
-        target_niche=arm_a_niche,
-        max_queries=max_queries,
-        max_pages_per_query=max_pages_per_query,
-        enable_price_partition=False
-    )
+    asins_baseline: Set[str] = set()
+    obs_count_baseline = 0
+
+    for page_num in range(1, pages_per_slice + 1):
+        url = f"https://www.amazon.com/s?k={quote(niche)}&page={page_num}" if page_num > 1 else f"https://www.amazon.com/s?k={quote(niche)}"
+        logger.info(f"[Baseline:ALL] Fetching page {page_num}/{pages_per_slice} -> {url}")
+        html, status, strategy_used = fetcher.fetch_page_html(url, query=niche, niche=bench_niche, run_id=session_id)
+
+        if status not in ("success", "zero_cards") or not html:
+            logger.warning(f"[Baseline:ALL] Page {page_num} returned status='{status}'.")
+            continue
+
+        products, observations = breadth_crawler.extract_cheap_products_from_html(
+            html, query=niche, lane="keyword_search", niche=bench_niche, page=page_num,
+            run_id=session_id, partition_type="NORMAL", partition_id="ALL",
+            strategy_used=strategy_used
+        )
+
+        for p in products:
+            db.save_product(p, record_snapshot=False)
+            asins_baseline.add(p["asin"])
+
+        for obs in observations:
+            db.record_search_observation(obs)
+            obs_count_baseline += 1
+
+        db.record_coverage_ledger_entry(
+            session_id=session_id,
+            niche=bench_niche,
+            lane="keyword_search",
+            query_or_target=niche,
+            page_number=page_num,
+            asins_found_total=len(products),
+            asins_new_unique=len(products),
+            asins_duplicate=0,
+            cumulative_unique=len(asins_baseline),
+            status=status,
+            strategy_used=strategy_used,
+            partition_type="NORMAL",
+            partition_id="ALL"
+        )
+        time.sleep(0.5)
+
     t_a = round(time.time() - t0_a, 2)
-
-    # Inspect Arm A products and observations
-    prods_a = db.get_products(niche=arm_a_niche, limit=5000, relevance_filter="ALL")
-    asins_a: Set[str] = {p["asin"] for p in prods_a}
-    core_a: Set[str] = {p["asin"] for p in prods_a if p.get("relevance_class") == "CORE"}
-    acc_a: Set[str] = {p["asin"] for p in prods_a if p.get("relevance_class") == "ACCESSORY"}
-    adj_a: Set[str] = {p["asin"] for p in prods_a if p.get("relevance_class") == "ADJACENT"}
-
-    ledger_a = db.get_coverage_ledger(arm_a_niche, limit=1000)
-    pages_a = len(ledger_a)
-
-    logger.info(f"[Arm A Completed] ASINs: {len(asins_a)} | CORE: {len(core_a)} | ACC: {len(acc_a)} | Pages: {pages_a} | Time: {t_a}s")
+    logger.info(f"[Baseline Completed] ASINs: {len(asins_baseline)} | Observations: {obs_count_baseline} | Time: {t_a}s")
 
     # -------------------------------------------------------------
-    # Arm B: Baseline + Price Partitioning
+    # PHASE B: Price Partitions (PRICE_0_25, PRICE_25_60, etc.)
     # -------------------------------------------------------------
-    logger.info("\n=======================================================")
-    logger.info(">>> RUNNING ARM B: BASELINE + PRICE PARTITIONING    <<<")
-    logger.info("=======================================================")
-    arm_b_niche = f"{niche}_ab_partition_{benchmark_id}"
+    logger.info("\n" + "=" * 65)
+    logger.info(">>> PHASE B: PRICE PARTITIONS (PRICE SLICES)          <<<")
+    logger.info("=" * 65)
     t0_b = time.time()
-    res_b = breadth_crawler.run_breadth_discovery_saturation_loop(
-        seed_keyword=niche,
-        target_niche=arm_b_niche,
-        max_queries=max_queries + 4,
-        max_pages_per_query=max_pages_per_query,
-        enable_price_partition=True
-    )
+
+    # Get semantic buckets
+    observed_sample_prices = db.get_observed_prices_for_niche(bench_niche)
+    buckets = taxonomy_registry.get_semantic_price_buckets(bench_niche, query=niche, observed_prices=observed_sample_prices)
+
+    slice_incremental_yield: Dict[str, Any] = {}
+    slice_observations: Dict[str, int] = {"ALL": obs_count_baseline}
+    all_slice_asins: Set[str] = set()
+
+    for bucket in buckets:
+        p_id = bucket["partition_id"]
+        min_p = bucket["min_price"]
+        max_p = bucket["max_price"]
+        price_param = taxonomy_registry.build_amazon_price_slice_param(min_p, max_p)
+
+        slice_asins: Set[str] = set()
+        slice_obs_count = 0
+
+        logger.info(f"\n--- Crawling Slice [{p_id}] (${min_p} - ${max_p or '+'}) ---")
+
+        for page_num in range(1, pages_per_slice + 1):
+            url = f"https://www.amazon.com/s?k={quote(niche)}&page={page_num}{price_param}" if page_num > 1 else f"https://www.amazon.com/s?k={quote(niche)}{price_param}"
+            logger.info(f"[{p_id}] Fetching page {page_num}/{pages_per_slice} -> {url}")
+            html, status, strategy_used = fetcher.fetch_page_html(url, query=niche, niche=bench_niche, run_id=session_id)
+
+            if status not in ("success", "zero_cards") or not html:
+                logger.warning(f"[{p_id}] Page {page_num} returned status='{status}'.")
+                continue
+
+            products, observations = breadth_crawler.extract_cheap_products_from_html(
+                html, query=niche, lane="price_partition", niche=bench_niche, page=page_num,
+                run_id=session_id, partition_type="PRICE", partition_id=p_id,
+                min_price=min_p, max_price=max_p, strategy_used=strategy_used
+            )
+
+            for p in products:
+                db.save_product(p, record_snapshot=False)
+                slice_asins.add(p["asin"])
+                all_slice_asins.add(p["asin"])
+
+            for obs in observations:
+                db.record_search_observation(obs)
+                slice_obs_count += 1
+
+            db.record_coverage_ledger_entry(
+                session_id=session_id,
+                niche=bench_niche,
+                lane="price_partition",
+                query_or_target=niche,
+                page_number=page_num,
+                asins_found_total=len(products),
+                asins_new_unique=len(slice_asins - asins_baseline),
+                asins_duplicate=len(slice_asins & asins_baseline),
+                cumulative_unique=len(asins_baseline | all_slice_asins),
+                status=status,
+                strategy_used=strategy_used,
+                partition_type="PRICE",
+                partition_id=p_id
+            )
+            time.sleep(0.5)
+
+        slice_observations[p_id] = slice_obs_count
+        net_new_from_slice = slice_asins - asins_baseline
+        slice_incremental_yield[p_id] = {
+            "label": bucket.get("label", p_id),
+            "min_price": min_p,
+            "max_price": max_p,
+            "observations": slice_obs_count,
+            "total_asins_in_slice": len(slice_asins),
+            "net_new_unique_vs_baseline": len(net_new_from_slice),
+            "duplicate_with_baseline_count": len(slice_asins & asins_baseline)
+        }
+        logger.info(f"[{p_id} Result] Obs: {slice_obs_count} | Slice ASINs: {len(slice_asins)} | Net New vs Baseline: +{len(net_new_from_slice)}")
+
     t_b = round(time.time() - t0_b, 2)
 
-    # Inspect Arm B products and observations
-    prods_b = db.get_products(niche=arm_b_niche, limit=5000, relevance_filter="ALL")
-    asins_b: Set[str] = {p["asin"] for p in prods_b}
-    core_b: Set[str] = {p["asin"] for p in prods_b if p.get("relevance_class") == "CORE"}
-    acc_b: Set[str] = {p["asin"] for p in prods_b if p.get("relevance_class") == "ACCESSORY"}
-    adj_b: Set[str] = {p["asin"] for p in prods_b if p.get("relevance_class") == "ADJACENT"}
+    # Relevance classification
+    relevance_engine.classify_niche_products(bench_niche)
+    all_prods = db.get_products(niche=bench_niche, limit=5000, relevance_filter="ALL")
+    core_asins: Set[str] = {p["asin"] for p in all_prods if p.get("relevance_class") == "CORE"}
+    acc_asins: Set[str] = {p["asin"] for p in all_prods if p.get("relevance_class") == "ACCESSORY"}
+    adj_asins: Set[str] = {p["asin"] for p in all_prods if p.get("relevance_class") == "ADJACENT"}
 
-    ledger_b = db.get_coverage_ledger(arm_b_niche, limit=1000)
-    pages_b = len(ledger_b)
-
-    # Differential Metrics
-    new_asins = asins_b - asins_a
-    new_core = core_b - core_a
-    new_acc = acc_b - acc_a
-    new_adj = adj_b - adj_a
-
-    # Search Observations comparison
+    # Transports breakdown
     conn = db.get_db()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM search_observations WHERE niche=?", (arm_a_niche,))
-    obs_count_a = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*), partition_id FROM search_observations WHERE niche=? GROUP BY partition_id", (arm_b_niche,))
-    slice_breakdown_rows = cur.fetchall()
-    obs_count_b = sum(r[0] for r in slice_breakdown_rows)
-    slice_observations = {r[1]: r[0] for r in slice_breakdown_rows}
-
-    # Transports used in Arm B
-    cur.execute("SELECT transport_used, COUNT(*) FROM search_observations WHERE niche=? GROUP BY transport_used", (arm_b_niche,))
-    transport_rows = cur.fetchall()
-    transport_counts = {r[0]: r[1] for r in transport_rows}
-
+    cur.execute("SELECT transport_used, COUNT(*) FROM search_observations WHERE niche=? GROUP BY transport_used", (bench_niche,))
+    transport_counts = {r[0]: r[1] for r in cur.fetchall()}
     conn.close()
 
-    # Sub-clusters in Arm B
-    sub_clusters_b = db.get_sub_niche_cluster_aggregates(arm_b_niche)
-    sub_niches_b = [c["sub_cluster"] for c in sub_clusters_b]
-
-    # Duplicate rate across slices in Arm B
-    duplicate_rate_b = round(((obs_count_b - len(asins_b)) / max(1, obs_count_b) * 100), 2)
+    # Total combined and genuine incremental
+    total_combined_asins = asins_baseline | all_slice_asins
+    total_genuine_incremental = all_slice_asins - asins_baseline
+    total_all_obs = sum(slice_observations.values())
 
     report = {
         "benchmark_id": benchmark_id,
         "niche": niche,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "arm_a_baseline": {
-            "total_asins": len(asins_a),
-            "core_asins": len(core_a),
-            "accessory_asins": len(acc_a),
-            "adjacent_asins": len(adj_a),
-            "search_observations": obs_count_a,
-            "pages_requested": pages_a,
+        "pages_per_slice": pages_per_slice,
+        "baseline_normal": {
+            "query": niche,
+            "partition_id": "ALL",
+            "unique_asins": len(asins_baseline),
+            "observations": obs_count_baseline,
             "runtime_seconds": t_a
         },
-        "arm_b_partitioned": {
-            "total_asins": len(asins_b),
-            "core_asins": len(core_b),
-            "accessory_asins": len(acc_b),
-            "adjacent_asins": len(adj_b),
-            "search_observations": obs_count_b,
-            "pages_requested": pages_b,
-            "runtime_seconds": t_b,
-            "duplicate_rate_pct": duplicate_rate_b,
+        "price_partitions_harvest": {
+            "total_slices_evaluated": len(buckets),
             "slice_observations": slice_observations,
-            "transports": transport_counts,
-            "sub_niche_clusters": sub_niches_b
+            "slice_incremental_yield": slice_incremental_yield,
+            "total_partition_unique_asins": len(all_slice_asins),
+            "runtime_seconds": t_b
         },
-        "incremental_delta": {
-            "net_unique_asins_gained": len(new_asins),
-            "net_core_asins_gained": len(new_core),
-            "net_accessory_asins_gained": len(new_acc),
-            "net_adjacent_asins_gained": len(new_adj),
-            "net_observations_gained": obs_count_b - obs_count_a,
-            "core_lift_pct": round((len(core_b) - len(core_a)) / max(1, len(core_a)) * 100, 2),
-            "total_lift_pct": round((len(asins_b) - len(asins_a)) / max(1, len(asins_a)) * 100, 2)
-        }
+        "genuine_incremental_lift": {
+            "total_combined_unique_asins": len(total_combined_asins),
+            "net_genuine_incremental_asins": len(total_genuine_incremental),
+            "incremental_lift_pct": round(len(total_genuine_incremental) / max(1, len(asins_baseline)) * 100, 2),
+            "core_asins_count": len(core_asins),
+            "accessory_asins_count": len(acc_asins),
+            "adjacent_asins_count": len(adj_asins)
+        },
+        "transports_used": transport_counts
     }
 
     # Print ASCII Report
-    print("\n" + "=" * 90)
-    print("       A/B INCREMENTAL BENCHMARK: BASELINE vs BASELINE + PRICE PARTITION")
-    print("=" * 90)
-    print(f"{'Metric':<35} | {'Arm A (Baseline)':<20} | {'Arm B (With Partitions)':<22} | {'Lift / Delta':<10}")
-    print("-" * 90)
-    print(f"{'Total Unique ASINs':<35} | {len(asins_a):<20} | {len(asins_b):<22} | +{len(new_asins)} ({report['incremental_delta']['total_lift_pct']}%)")
-    print(f"{'  - CORE Suitcases':<35} | {len(core_a):<20} | {len(core_b):<22} | +{len(new_core)} ({report['incremental_delta']['core_lift_pct']}%)")
-    print(f"{'  - ACCESSORIES (Locks, Tags)':<35} | {len(acc_a):<20} | {len(acc_b):<22} | +{len(new_acc)}")
-    print(f"{'  - ADJACENT (Duffels, Packs)':<35} | {len(adj_a):<20} | {len(adj_b):<22} | +{len(new_adj)}")
-    print(f"{'Search Observations Stored':<35} | {obs_count_a:<20} | {obs_count_b:<22} | +{obs_count_b - obs_count_a}")
-    print(f"{'Duplicate Observation Rate':<35} | {'N/A':<20} | {duplicate_rate_b}%{'':<18} | Cross-slice freq")
-    print(f"{'Pages Requested':<35} | {pages_a:<20} | {pages_b:<22} | +{pages_b - pages_a}")
-    print(f"{'Runtime (Seconds)':<35} | {t_a}s{'':<17} | {t_b}s{'':<19} | +{round(t_b - t_a, 2)}s")
-    print("=" * 90)
+    print("\n" + "=" * 95)
+    print("          GENUINE PRICE PARTITION A/B BENCHMARK REPORT")
+    print("=" * 95)
+    print(f"Niche Keyword: {niche} | Pages per Slice: {pages_per_slice} | Benchmark ID: {benchmark_id}")
+    print("-" * 95)
+    print(f"{'Partition / Slice':<25} | {'Observations':<15} | {'Slice ASINs':<15} | {'Net New vs Baseline':<20}")
+    print("-" * 95)
+    print(f"{'Baseline: ALL':<25} | {obs_count_baseline:<15} | {len(asins_baseline):<15} | {'(Baseline Reference)':<20}")
+    for pid, y in slice_incremental_yield.items():
+        print(f"{pid:<25} | {y['observations']:<15} | {y['total_asins_in_slice']:<15} | +{y['net_new_unique_vs_baseline']}")
+    print("-" * 95)
+    print(f"{'TOTAL COMBINED UNIVERSE':<25} | {total_all_obs:<15} | {len(total_combined_asins):<15} | +{len(total_genuine_incremental)} ({report['genuine_incremental_lift']['incremental_lift_pct']}%)")
+    print(f"  - CORE Products: {len(core_asins)} | ACCESSORIES: {len(acc_asins)} | ADJACENT: {len(adj_asins)}")
+    print(f"  - Transports: {transport_counts}")
+    print(f"  - Baseline Time: {t_a}s | Partitions Time: {t_b}s | Total: {round(t_a + t_b, 2)}s")
+    print("=" * 95)
 
     # Save to disk
     out_file = BASE_DIR / "data" / "benchmarks" / "price_partition_ab_results.json"
@@ -185,6 +255,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--niche", type=str, default="luggage")
     parser.add_argument("--pages", type=int, default=1)
-    parser.add_argument("--queries", type=int, default=2)
     args = parser.parse_args()
-    run_ab_benchmark(niche=args.niche, max_pages_per_query=args.pages, max_queries=args.queries)
+    run_ab_benchmark(niche=args.niche, pages_per_slice=args.pages)
+

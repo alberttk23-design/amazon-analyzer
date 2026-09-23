@@ -249,6 +249,22 @@ def get_cdp_launch_command(port: int = 9222) -> str:
         return f'google-chrome --remote-debugging-port={port} --user-data-dir="{p_str}" --no-first-run &'
 
 
+def verify_session_usable() -> Dict:
+    """
+    Verifies that the session/browser environment is usable for resuming crawls.
+    Returns status dict indicating readiness and whether local CDP is reachable.
+    """
+    status = get_session_status()
+    cdp_active = is_cdp_available()
+    return {
+        "usable": status.get("status") in ("logged_in", "guest_active", "guest", "no_profile"),
+        "cdp_available": cdp_active,
+        "session_status": status.get("status"),
+        "cookie_count": status.get("cookie_count", 0),
+        "message": status.get("message")
+    }
+
+
 if __name__ == "__main__":
     print("Testing Amazon session manager...")
     st = get_session_status()

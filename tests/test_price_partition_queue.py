@@ -204,3 +204,115 @@ def test_api_price_partition_request_models():
 
     req2 = BreadthDiscoverRequest(seed_keyword="luggage", enable_price_partition=True)
     assert req2.enable_price_partition is True
+
+
+def test_price_partition_priority_before_secondary_keywords():
+    """Verify that price partitions are prioritized ahead of secondary keyword variants."""
+    db.init_db()
+    suffix = uuid.uuid4().hex[:6].upper()
+    niche = f"Priority_Order_Test_{suffix}"
+    seed = "luggage"
+
+    lanes = breadth_crawler.expand_niche_lanes(seed)
+    queue_entries = []
+
+    # 1. Primary Seed Query
+    queue_entries.append({
+        "lane": "keyword_search",
+        "query": seed,
+        "priority": 1,
+        "target_pages": 3,
+        "partition_type": "NORMAL",
+        "partition_id": "ALL"
+    })
+
+    # 2. Price Partitions (Priority 1)
+    buckets = taxonomy_registry.get_semantic_price_buckets(niche, query=seed)
+    for b in buckets:
+        queue_entries.append({
+            "lane": "price_partition",
+            "query": seed,
+            "priority": 1,
+            "target_pages": 3,
+            "partition_type": "PRICE",
+            "partition_id": b["partition_id"],
+            "min_price": b["min_price"],
+            "max_price": b["max_price"]
+        })
+
+    # 3. Secondary keywords (Priority 2)
+    for q in lanes.get("keyword_search", []):
+        if q.strip().lower() != seed.lower():
+            queue_entries.append(("keyword_search", q, 2))
+
+    # 4. Suggestions (Priority 3)
+    for q in lanes.get("suggestions", []):
+        if q.strip().lower() != seed.lower():
+            queue_entries.append(("suggestions", q, 3))
+
+    db.enqueue_discovery_queries(niche, queue_entries)
+
+    # Pop 1: Must be seed keyword ALL
+    item1 = db.get_next_pending_query(niche)
+    assert item1["query"] == seed
+    assert item1["partition_id"] == "ALL"
+    db.mark_discovery_query_status(niche, item1["query"], "completed", partition_id=item1["partition_id"])
+
+    # Next 4 pops: MUST be the price partitions of the seed keyword!
+    popped_slices = []
+    for _ in range(4):
+        item = db.get_next_pending_query(niche)
+        assert item is not None
+        assert item["partition_type"] == "PRICE", f"Expected PRICE partition before secondary queries, got {item['partition_type']}:{item['query']}"
+        popped_slices.append(item["partition_id"])
+        db.mark_discovery_query_status(niche, item["query"], "completed", partition_type="PRICE", partition_id=item["partition_id"])
+
+    assert len(popped_slices) == 4
+    assert set(popped_slices) == {"PRICE_0_25", "PRICE_25_60", "PRICE_60_150", "PRICE_150_PLUS"}
+
+    # Pop 6: ONLY NOW should secondary keywords appear!
+    item_sec = db.get_next_pending_query(niche)
+    assert item_sec is not None
+    assert item_sec["priority"] == 2
+    assert item_sec["query"] != seed
+
+
+def test_dynamic_percentile_price_buckets_from_observed_prices():
+    """Verify dynamic 25/50/75 percentile price bucket derivation from observed prices."""
+    db.init_db()
+    suffix = uuid.uuid4().hex[:6].upper()
+    niche = f"Unknown_Dynamic_Niche_{suffix}"
+
+    # Sample 20 prices: 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 120
+    test_prices = [10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0,
+                   60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, 120.0]
+
+    for idx, p in enumerate(test_prices):
+        obs = {
+            "run_id": f"run_{suffix}",
+            "niche": niche,
+            "asin": f"B0DYN{suffix[:4]}{idx:02d}",
+            "query": "unknown gadget",
+            "page": 1,
+            "position": idx + 1,
+            "price": p,
+            "rating": 4.2,
+            "reviews_count": 50,
+            "partition_type": "NORMAL",
+            "partition_id": "ALL"
+        }
+        db.record_search_observation(obs)
+
+    observed = db.get_observed_prices_for_niche(niche)
+    assert len(observed) == 20
+
+    # Derive buckets
+    buckets = taxonomy_registry.get_semantic_price_buckets(niche, query="unknown gadget", observed_prices=observed)
+    assert len(buckets) == 4
+    # Percentiles: 25th is idx 5 (35.0), 50th is idx 10 (60.0), 75th is idx 15 (85.0)
+    p_ids = [b["partition_id"] for b in buckets]
+    assert p_ids[0] == "PRICE_0_35"
+    assert p_ids[1] == "PRICE_35_60"
+    assert p_ids[2] == "PRICE_60_85"
+    assert p_ids[3] == "PRICE_85_PLUS"
+
