@@ -160,6 +160,14 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_niche ON coverage_ledger(niche)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_session ON coverage_ledger(session_id)")
+    cursor.execute("PRAGMA table_info(coverage_ledger)")
+    existing_ledger_cols = {row[1] for row in cursor.fetchall()}
+    for col, col_t in [("partition_type", "TEXT DEFAULT 'NORMAL'"), ("partition_id", "TEXT DEFAULT 'ALL'")]:
+        if col not in existing_ledger_cols:
+            try:
+                cursor.execute(f"ALTER TABLE coverage_ledger ADD COLUMN {col} {col_t}")
+            except Exception:
+                pass
 
     # 3.1 Niche Products Junction Table (Entity & Membership Decoupled + Relevance Classification)
     cursor.execute("""
@@ -237,15 +245,20 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_variant_child ON product_variations(child_asin)")
 
     # 4. Discovery Query Queue (Multi-lane expansion & page-level checkpoint)
+    # 4. Discovery Query Queue (Multi-lane expansion, partition slices & page-level checkpoint)
     cursor.execute("PRAGMA table_info(discovery_query_queue)")
     q_cols = {row[1] for row in cursor.fetchall()}
-    if "next_page" not in q_cols:
+    if "partition_id" not in q_cols:
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS discovery_query_queue_v2 (
+        CREATE TABLE IF NOT EXISTS discovery_query_queue_v3 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             niche TEXT NOT NULL,
             lane TEXT DEFAULT 'keyword_search',
             query TEXT NOT NULL,
+            partition_type TEXT DEFAULT 'NORMAL',
+            partition_id TEXT DEFAULT 'ALL',
+            min_price REAL DEFAULT 0.0,
+            max_price REAL DEFAULT 0.0,
             status TEXT DEFAULT 'pending',
             priority INTEGER DEFAULT 1,
             target_pages INTEGER DEFAULT 3,
@@ -255,16 +268,27 @@ def init_db():
             last_error TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(niche, query)
+            UNIQUE(niche, query, partition_type, partition_id)
         )
         """)
-        cursor.execute("""
-        INSERT OR IGNORE INTO discovery_query_queue_v2 (id, niche, lane, query, status, priority, created_at)
-        SELECT id, niche, lane, query, status, priority, created_at FROM discovery_query_queue
-        """)
-        cursor.execute("DROP TABLE discovery_query_queue")
-        cursor.execute("ALTER TABLE discovery_query_queue_v2 RENAME TO discovery_query_queue")
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_query_queue'")
+        if cursor.fetchone():
+            cursor.execute("""
+            INSERT OR IGNORE INTO discovery_query_queue_v3 (
+                id, niche, lane, query, partition_type, partition_id, min_price, max_price,
+                status, priority, target_pages, last_completed_page, next_page, retry_count,
+                last_error, created_at, updated_at
+            )
+            SELECT 
+                id, niche, lane, query, 'NORMAL', 'ALL', 0.0, 0.0,
+                status, priority, target_pages, last_completed_page, next_page, retry_count,
+                last_error, created_at, updated_at
+            FROM discovery_query_queue
+            """)
+            cursor.execute("DROP TABLE discovery_query_queue")
+        cursor.execute("ALTER TABLE discovery_query_queue_v3 RENAME TO discovery_query_queue")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_query_queue ON discovery_query_queue(niche, status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_query_queue_part ON discovery_query_queue(niche, partition_type, partition_id)")
 
     # 5. Customer Reviews table
     cursor.execute("""
@@ -409,13 +433,26 @@ def init_db():
         price REAL DEFAULT 0.0,
         rating REAL DEFAULT 0.0,
         reviews_count INTEGER DEFAULT 0,
+        partition_type TEXT DEFAULT 'NORMAL',
+        partition_id TEXT DEFAULT 'ALL',
+        price_min REAL DEFAULT 0.0,
+        price_max REAL DEFAULT 0.0,
+        transport_used TEXT DEFAULT 'HTTP_FAST',
         observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(asin) REFERENCES products(asin)
     )
     """)
     cursor.execute("PRAGMA table_info(search_observations)")
     existing_obs_cols = {row["name"] for row in cursor.fetchall()}
-    for col, col_t in [("confidence", "TEXT DEFAULT 'HIGH'"), ("evidence_signals_json", "TEXT DEFAULT '[]'")]:
+    for col, col_t in [
+        ("confidence", "TEXT DEFAULT 'HIGH'"),
+        ("evidence_signals_json", "TEXT DEFAULT '[]'"),
+        ("partition_type", "TEXT DEFAULT 'NORMAL'"),
+        ("partition_id", "TEXT DEFAULT 'ALL'"),
+        ("price_min", "REAL DEFAULT 0.0"),
+        ("price_max", "REAL DEFAULT 0.0"),
+        ("transport_used", "TEXT DEFAULT 'HTTP_FAST'")
+    ]:
         if col not in existing_obs_cols:
             try:
                 cursor.execute(f"ALTER TABLE search_observations ADD COLUMN {col} {col_t}")
@@ -427,6 +464,7 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_run ON search_observations(run_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_niche ON search_observations(niche)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_placement ON search_observations(placement_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_obs_partition ON search_observations(niche, partition_id)")
 
     # 13. Research Runs table (Tracking runs, query universe, failures, coverage)
     cursor.execute("""
@@ -817,8 +855,12 @@ def get_products(
     min_rating: Optional[float] = None,
     is_sponsored: Optional[int] = None,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
+    niche: Optional[str] = None
 ) -> List[Dict[str, Any]]:
+    if not keyword and niche:
+        keyword = niche
+
     conn = get_db()
     cursor = conn.cursor()
 
@@ -1087,7 +1129,9 @@ def record_coverage_ledger_entry(
     asins_duplicate: int,
     cumulative_unique: int,
     status: str = "success",
-    strategy_used: str = "http_fast"
+    strategy_used: str = "http_fast",
+    partition_type: str = "NORMAL",
+    partition_id: str = "ALL"
 ) -> int:
     conn = get_db()
     cursor = conn.cursor()
@@ -1096,12 +1140,14 @@ def record_coverage_ledger_entry(
     INSERT INTO coverage_ledger (
         session_id, niche, lane, query_or_target, page_number,
         asins_found_total, asins_new_unique, asins_duplicate,
-        marginal_yield, cumulative_unique, status, strategy_used
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        marginal_yield, cumulative_unique, status, strategy_used,
+        partition_type, partition_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         session_id, niche, lane, query_or_target, page_number,
         asins_found_total, asins_new_unique, asins_duplicate,
-        marginal_yield, cumulative_unique, status, strategy_used
+        marginal_yield, cumulative_unique, status, strategy_used,
+        partition_type, partition_id
     ))
     entry_id = cursor.lastrowid
     conn.commit()
@@ -1812,11 +1858,13 @@ def record_search_observation(obs: Dict[str, Any]) -> int:
         run_id, niche, asin, query, page, position,
         placement_type, confidence, sponsored_evidence, evidence_signals_json,
         badges_json, coupon, delivery_signal, price, rating, reviews_count,
+        partition_type, partition_id, price_min, price_max, transport_used,
         observed_at
     ) VALUES (
         :run_id, :niche, :asin, :query, :page, :position,
         :placement_type, :confidence, :sponsored_evidence, :evidence_signals_json,
         :badges_json, :coupon, :delivery_signal, :price, :rating, :reviews_count,
+        :partition_type, :partition_id, :price_min, :price_max, :transport_used,
         CURRENT_TIMESTAMP
     )
     """, {
@@ -1836,6 +1884,11 @@ def record_search_observation(obs: Dict[str, Any]) -> int:
         "price": float(obs.get("price") or 0.0),
         "rating": float(obs.get("rating") or 0.0),
         "reviews_count": int(obs.get("reviews_count") or 0),
+        "partition_type": obs.get("partition_type") or "NORMAL",
+        "partition_id": obs.get("partition_id") or "ALL",
+        "price_min": float(obs.get("price_min") or 0.0),
+        "price_max": float(obs.get("price_max") or 0.0),
+        "transport_used": obs.get("transport_used") or "HTTP_FAST",
     })
     obs_id = cursor.lastrowid
     conn.commit()
@@ -2203,33 +2256,63 @@ def enqueue_discovery_queries(
     target_pages: int = 3
 ) -> int:
     """
-    Enqueue queries into discovery_query_queue with composite UNIQUE(niche, query).
-    queries: List of (lane, query, priority) or (lane, query, priority, target_pages) or simple str queries.
+    Enqueue queries into discovery_query_queue with composite UNIQUE(niche, query, partition_type, partition_id).
+    queries can be:
+      - str: simple query string
+      - tuple/list: (lane, query, priority) or (lane, query, priority, target_pages)
+                   or (lane, query, priority, target_pages, partition_type, partition_id, min_price, max_price)
+      - dict: with keys lane, query, priority, target_pages, partition_type, partition_id, min_price, max_price
     """
     conn = get_db()
     cursor = conn.cursor()
     enqueued = 0
     for item in queries:
+        part_type = "NORMAL"
+        part_id = "ALL"
+        min_p = 0.0
+        max_p = 0.0
+
         if isinstance(item, str):
             lane, query, priority, tp = "keyword_search", item, 10, target_pages
+        elif isinstance(item, dict):
+            lane = item.get("lane", "keyword_search")
+            query = item.get("query", "")
+            priority = item.get("priority", 10)
+            tp = item.get("target_pages", target_pages)
+            part_type = item.get("partition_type", "NORMAL")
+            part_id = item.get("partition_id", "ALL")
+            min_p = float(item.get("min_price") or 0.0)
+            max_p = float(item.get("max_price") or 0.0)
         elif isinstance(item, (tuple, list)):
             if len(item) == 2:
                 lane, query, priority, tp = item[0], item[1], 10, target_pages
             elif len(item) == 3:
                 lane, query, priority, tp = item[0], item[1], item[2], target_pages
-            elif len(item) >= 4:
+            elif len(item) == 4:
                 lane, query, priority, tp = item[0], item[1], item[2], item[3]
+            elif len(item) >= 8:
+                lane, query, priority, tp = item[0], item[1], item[2], item[3]
+                part_type, part_id, min_p, max_p = item[4], item[5], float(item[6]), float(item[7])
+            elif len(item) >= 6:
+                lane, query, priority, tp = item[0], item[1], item[2], item[3]
+                part_type, part_id = item[4], item[5]
             else:
                 continue
         else:
             continue
 
+        if not query:
+            continue
+
         try:
             cursor.execute("""
-            INSERT INTO discovery_query_queue (niche, lane, query, status, priority, target_pages, last_completed_page, next_page)
-            VALUES (?, ?, ?, 'pending', ?, ?, 0, 1)
-            ON CONFLICT(niche, query) DO NOTHING
-            """, (niche, lane, query, priority, tp))
+            INSERT INTO discovery_query_queue (
+                niche, lane, query, partition_type, partition_id, min_price, max_price,
+                status, priority, target_pages, last_completed_page, next_page
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 1)
+            ON CONFLICT(niche, query, partition_type, partition_id) DO NOTHING
+            """, (niche, lane, query, part_type, part_id, min_p, max_p, priority, tp))
             if cursor.rowcount > 0:
                 enqueued += 1
         except Exception:
@@ -2243,7 +2326,8 @@ def get_pending_discovery_queries(niche: str, limit: int = 100) -> List[Dict[str
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT id, niche, lane, query, status, priority, target_pages, last_completed_page, next_page, retry_count, last_error, created_at
+    SELECT id, niche, lane, query, partition_type, partition_id, min_price, max_price,
+           status, priority, target_pages, last_completed_page, next_page, retry_count, last_error, created_at
     FROM discovery_query_queue
     WHERE niche = ? AND status = 'pending'
     ORDER BY priority ASC, id ASC
@@ -2259,7 +2343,8 @@ def get_next_pending_query(niche: str) -> Optional[Dict[str, Any]]:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT id, niche, lane, query, status, priority, target_pages, last_completed_page, next_page, retry_count, last_error
+    SELECT id, niche, lane, query, partition_type, partition_id, min_price, max_price,
+           status, priority, target_pages, last_completed_page, next_page, retry_count, last_error
     FROM discovery_query_queue
     WHERE niche = ? AND status = 'pending'
     ORDER BY priority ASC, id ASC
@@ -2276,23 +2361,35 @@ def update_query_progress(
     page_num: int,
     status: str = 'in_progress',
     error: str = '',
-    success: bool = True
+    success: bool = True,
+    partition_type: Optional[str] = None,
+    partition_id: Optional[str] = None
 ) -> bool:
     """Update page-level progress in discovery_query_queue for exact recovery."""
     conn = get_db()
     cursor = conn.cursor()
-    if success and status not in ('failed', 'error', 'captcha'):
-        cursor.execute("""
+    where_extra = ""
+    params_extra = []
+    if partition_type is not None:
+        where_extra += " AND partition_type = ?"
+        params_extra.append(partition_type)
+    if partition_id is not None:
+        where_extra += " AND partition_id = ?"
+        params_extra.append(partition_id)
+
+    if success and status not in ('failed', 'error', 'captcha', 'paused_captcha'):
+        sql = f"""
         UPDATE discovery_query_queue
         SET status = ?,
             last_completed_page = ?,
             next_page = ?,
             last_error = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE niche = ? AND query = ?
-        """, (status, page_num, page_num + 1, error, niche, query))
+        WHERE niche = ? AND query = ? {where_extra}
+        """
+        cursor.execute(sql, [status, page_num, page_num + 1, error, niche, query] + params_extra)
     else:
-        cursor.execute("""
+        sql = f"""
         UPDATE discovery_query_queue
         SET status = ?,
             last_completed_page = CASE WHEN last_completed_page >= ? THEN last_completed_page ELSE max(0, ? - 1) END,
@@ -2300,24 +2397,42 @@ def update_query_progress(
             retry_count = retry_count + 1,
             last_error = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE niche = ? AND query = ?
-        """, (status, page_num, page_num, page_num, error, niche, query))
+        WHERE niche = ? AND query = ? {where_extra}
+        """
+        cursor.execute(sql, [status, page_num, page_num, page_num, error, niche, query] + params_extra)
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()
     return updated
 
 
-def mark_discovery_query_status(niche: str, query: str, status: str, error: str = '') -> bool:
+def mark_discovery_query_status(
+    niche: str,
+    query: str,
+    status: str,
+    error: str = '',
+    partition_type: Optional[str] = None,
+    partition_id: Optional[str] = None
+) -> bool:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+    where_extra = ""
+    params_extra = []
+    if partition_type is not None:
+        where_extra += " AND partition_type = ?"
+        params_extra.append(partition_type)
+    if partition_id is not None:
+        where_extra += " AND partition_id = ?"
+        params_extra.append(partition_id)
+
+    sql = f"""
     UPDATE discovery_query_queue
     SET status = ?,
         last_error = ?,
         updated_at = CURRENT_TIMESTAMP
-    WHERE niche = ? AND query = ?
-    """, (status, error, niche, query))
+    WHERE niche = ? AND query = ? {where_extra}
+    """
+    cursor.execute(sql, [status, error, niche, query] + params_extra)
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()

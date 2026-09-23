@@ -19,6 +19,7 @@ import backend.db as db
 import backend.session_manager as session_manager
 import backend.diagnostics as diagnostics
 import backend.relevance_engine as relevance_engine
+import backend.taxonomy_registry as taxonomy_registry
 from datetime import datetime
 
 logger = logging.getLogger("amazon.breadth")
@@ -200,7 +201,12 @@ def extract_cheap_products_from_html(
     lane: str,
     niche: str,
     page: int = 1,
-    run_id: str = ""
+    run_id: str = "",
+    partition_type: str = "NORMAL",
+    partition_id: str = "ALL",
+    min_price: float = 0.0,
+    max_price: float = 0.0,
+    strategy_used: str = "HTTP_FAST"
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Extracts cheap fields for all ASINs appearing on the Amazon search result page.
@@ -356,13 +362,19 @@ def extract_cheap_products_from_html(
             "page": page,
             "position": card_idx,
             "placement_type": placement_type,
+            "confidence": "HIGH",
             "sponsored_evidence": sponsored_evidence,
             "coupon": coupon_text,
             "delivery_signal": deliv_text,
             "price": price,
             "rating": rating,
             "reviews_count": reviews_count,
-            "badges": [b for b in ["Best Seller" if is_best_seller else "", "Amazon's Choice" if is_choice else ""] if b]
+            "badges": [b for b in ["Best Seller" if is_best_seller else "", "Amazon's Choice" if is_choice else ""] if b],
+            "partition_type": partition_type,
+            "partition_id": partition_id,
+            "price_min": min_price,
+            "price_max": max_price,
+            "transport_used": strategy_used
         }
         observations.append(obs_record)
 
@@ -420,7 +432,7 @@ class StrategyLadderFetcher:
             if res.status_code == 200:
                 html = res.text
                 if "Type the characters you see in this image" in html or "validateCaptcha" in html:
-                    logger.info("[StrategyLadder] Fast HTTP encountered Captcha! Capturing snapshot & switching to Playwright...")
+                    logger.info("[StrategyLadder] Fast HTTP encountered Captcha! Capturing snapshot & evaluating browser transports...")
                     diagnostics.capture_failure_snapshot(
                         niche=niche, query_or_asin=query or url,
                         status="captcha_detected",
@@ -428,11 +440,11 @@ class StrategyLadderFetcher:
                         html=html, run_id=run_id
                     )
                 elif 'data-component-type="s-search-result"' in html:
-                    return html, "success", "http_fast"
+                    return html, "success", "HTTP_FAST"
                 else:
-                    logger.debug("[StrategyLadder] Fast HTTP returned 0 search result cards. Trying Playwright...")
+                    logger.debug("[StrategyLadder] Fast HTTP returned 0 search result cards. Trying browser fallback...")
             elif res.status_code in (403, 429, 503):
-                logger.warning(f"[StrategyLadder] Fast HTTP blocked with status {res.status_code}. Switching to Playwright...")
+                logger.warning(f"[StrategyLadder] Fast HTTP blocked with status {res.status_code}. Evaluating browser fallback...")
                 diagnostics.capture_failure_snapshot(
                     niche=niche, query_or_asin=query or url,
                     status=f"blocked_{res.status_code}",
@@ -440,12 +452,61 @@ class StrategyLadderFetcher:
                     html=res.text if res else "", run_id=run_id
                 )
             else:
-                logger.warning(f"[StrategyLadder] Fast HTTP got status {res.status_code}. Switching to Playwright...")
+                logger.warning(f"[StrategyLadder] Fast HTTP got status {res.status_code}. Evaluating browser fallback...")
         except Exception as e:
-            logger.debug(f"[StrategyLadder] Fast HTTP notice: {e}. Switching to Playwright...")
+            logger.debug(f"[StrategyLadder] Fast HTTP notice: {e}. Evaluating browser fallback...")
 
-        # Level 2: Playwright Local Browser
+        # Transport Planner: Evaluate LOCAL_CDP if Chrome port 9222 is alive
+        if session_manager.is_cdp_available(9222):
+            logger.info("[StrategyLadder] Local Chrome CDP port 9222 detected active! Routing via LOCAL_CDP...")
+            cdp_html, cdp_status, cdp_strat = self._fetch_via_cdp(url, query=query, niche=niche, run_id=run_id, port=9222)
+            if cdp_status == "success":
+                return cdp_html, "success", cdp_strat
+            logger.warning(f"[StrategyLadder] CDP returned '{cdp_status}'. Falling back to PLAYWRIGHT_PERSISTENT...")
+
+        # Level 3: PLAYWRIGHT_PERSISTENT Local Browser
         return self._fetch_via_playwright(url, query=query, niche=niche, run_id=run_id)
+
+    def _fetch_via_cdp(self, url: str, query: str = "", niche: str = "", run_id: str = "", port: int = 9222) -> Tuple[str, str, str]:
+        from playwright.sync_api import sync_playwright
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=40000)
+                page.wait_for_timeout(1500)
+                session_manager.ensure_amazon_zip_code(page, "10001")
+                for _ in range(3):
+                    page.mouse.wheel(0, random.randint(500, 1000))
+                    page.wait_for_timeout(500)
+                html = page.content()
+
+                is_captcha = "Type the characters you see in this image" in html or "validateCaptcha" in html
+                has_cards = 'data-component-type="s-search-result"' in html
+
+                if is_captcha:
+                    diagnostics.capture_failure_snapshot(
+                        niche=niche, query_or_asin=query or url,
+                        status="captcha_detected",
+                        reason="CDP session reached Amazon Captcha prompt",
+                        html=html, page_handle=page, run_id=run_id
+                    )
+                    return html, "captcha", "LOCAL_CDP"
+
+                if not has_cards:
+                    diagnostics.capture_failure_snapshot(
+                        niche=niche, query_or_asin=query or url,
+                        status="zero_cards",
+                        reason="CDP page loaded but zero search result cards were found",
+                        html=html, page_handle=page, run_id=run_id
+                    )
+                    return html, "zero_cards", "LOCAL_CDP"
+
+                return html, "success", "LOCAL_CDP"
+        except Exception as e:
+            logger.warning(f"[StrategyLadder] CDP fetch exception: {e}")
+            return "", "error", "LOCAL_CDP"
 
     def _fetch_via_playwright(self, url: str, query: str = "", niche: str = "", run_id: str = "") -> Tuple[str, str, str]:
         from playwright.sync_api import sync_playwright
@@ -481,7 +542,7 @@ class StrategyLadderFetcher:
                         html=html, page_handle=page, run_id=run_id
                     )
                     context.close()
-                    return html, "captcha", "playwright_browser"
+                    return html, "captcha", "PLAYWRIGHT_PERSISTENT"
 
                 if not has_cards:
                     logger.warning("[StrategyLadder] Playwright returned 0 search result cards. Dumping snapshot...")
@@ -492,10 +553,10 @@ class StrategyLadderFetcher:
                         html=html, page_handle=page, run_id=run_id
                     )
                     context.close()
-                    return html, "zero_cards", "playwright_browser"
+                    return html, "zero_cards", "PLAYWRIGHT_PERSISTENT"
 
                 context.close()
-                return html, "success", "playwright_browser"
+                return html, "success", "PLAYWRIGHT_PERSISTENT"
         except Exception as e:
             logger.error(f"[StrategyLadder] Playwright error for {url}: {e}")
             diagnostics.capture_failure_snapshot(
@@ -504,7 +565,7 @@ class StrategyLadderFetcher:
                 reason=f"Playwright navigation exception: {e}",
                 html="", run_id=run_id
             )
-            return "", "error", "playwright_browser"
+            return "", "error", "PLAYWRIGHT_PERSISTENT"
 
 
 # ---------------------------------------------------------
@@ -518,7 +579,8 @@ def run_breadth_discovery_saturation_loop(
     max_pages_per_query: int = 3,
     saturation_threshold_yield: float = 4.0,  # Below 4% new ASINs considered diminishing yield
     resume: bool = True,
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
+    enable_price_partition: bool = False
 ) -> Dict[str, Any]:
     """
     Main Breadth Discovery Pipeline:
@@ -542,9 +604,9 @@ def run_breadth_discovery_saturation_loop(
 
     logger.info(f"[BreadthCrawler] Initial universe for '{niche}' has {initial_count} ASINs.")
 
-    # 1. Multi-lane expansion and queue persistence (Composite UNIQUE(niche, query))
+    # 1. Multi-lane expansion and queue persistence (Composite UNIQUE(niche, query, partition_type, partition_id))
     lanes = expand_niche_lanes(seed_keyword)
-    queue_entries: List[Tuple[str, str, int]] = []
+    queue_entries: List[Any] = []
 
     for q in lanes.get("keyword_search", []):
         queue_entries.append(("keyword_search", q, 1))
@@ -552,6 +614,21 @@ def run_breadth_discovery_saturation_loop(
         queue_entries.append(("suggestions", q, 2))
     for q in lanes.get("intent_modifiers", []):
         queue_entries.append(("intent_modifiers", q, 3))
+
+    # Optional: Semantic Price Partitioning (Price Slicing)
+    if enable_price_partition:
+        semantic_buckets = taxonomy_registry.get_semantic_price_buckets(niche, query=seed_keyword)
+        for bucket in semantic_buckets:
+            queue_entries.append({
+                "lane": "price_partition",
+                "query": seed_keyword,
+                "priority": 2,
+                "target_pages": max_pages_per_query,
+                "partition_type": "PRICE",
+                "partition_id": bucket["partition_id"],
+                "min_price": bucket["min_price"],
+                "max_price": bucket["max_price"]
+            })
 
     db.enqueue_discovery_queries(niche, queue_entries)
 
@@ -581,7 +658,11 @@ def run_breadth_discovery_saturation_loop(
 
         lane = item.get("lane", "keyword_search")
         query = item.get("query", "")
-        db.mark_discovery_query_status(niche, query, "in_progress")
+        part_type = item.get("partition_type", "NORMAL")
+        part_id = item.get("partition_id", "ALL")
+        min_p = float(item.get("min_price") or 0.0)
+        max_p = float(item.get("max_price") or 0.0)
+        db.mark_discovery_query_status(niche, query, "in_progress", partition_type=part_type, partition_id=part_id)
 
         queries_executed += 1
         query_new_asins = 0
@@ -595,15 +676,20 @@ def run_breadth_discovery_saturation_loop(
 
         # Multi-Page Pagination Loop (Page start_page to target_pages)
         for page_num in range(start_page, target_pages + 1):
-            search_url = f"https://www.amazon.com/s?k={quote(query)}&page={page_num}" if page_num > 1 else f"https://www.amazon.com/s?k={quote(query)}"
-            logger.info(f"[BreadthCrawler] [{queries_executed}/{max_queries}] [{lane}] Query: '{query}' (Page {page_num}/{target_pages}) -> {search_url}")
+            if part_type == "PRICE":
+                price_param = taxonomy_registry.build_amazon_price_slice_param(min_p, max_p)
+                search_url = f"https://www.amazon.com/s?k={quote(query)}&page={page_num}{price_param}" if page_num > 1 else f"https://www.amazon.com/s?k={quote(query)}{price_param}"
+            else:
+                search_url = f"https://www.amazon.com/s?k={quote(query)}&page={page_num}" if page_num > 1 else f"https://www.amazon.com/s?k={quote(query)}"
+
+            logger.info(f"[BreadthCrawler] [{queries_executed}/{max_queries}] [{lane}:{part_id}] Query: '{query}' (Page {page_num}/{target_pages}) -> {search_url}")
 
             if job_id:
                 prog = 10 + int((queries_executed / max_queries) * 60)
                 db.update_job(
                     job_id,
                     progress=min(prog, 70),
-                    message=f"Đang cào rộng ({lane}): '{query}' [Trang {page_num}] | Đã tích lũy {len(cumulative_unique)} ASINs...",
+                    message=f"Đang cào rộng ({lane}:{part_id}): '{query}' [Trang {page_num}] | Đã tích lũy {len(cumulative_unique)} ASINs...",
                     cumulative_universe_count=len(cumulative_unique)
                 )
 
@@ -625,19 +711,31 @@ def run_breadth_discovery_saturation_loop(
                     asins_duplicate=0,
                     cumulative_unique=len(cumulative_unique),
                     status=f"empty_or_{status}",
-                    strategy_used=strategy_used
+                    strategy_used=strategy_used,
+                    partition_type=part_type,
+                    partition_id=part_id
                 )
-                db.update_query_progress(niche, query, page_num, status="failed", error=f"empty_or_{status}", success=False)
+                status_to_record = "paused_captcha" if status == "captcha" else "failed"
+                db.update_query_progress(
+                    niche, query, page_num, status=status_to_record,
+                    error=f"empty_or_{status}", success=False,
+                    partition_type=part_type, partition_id=part_id
+                )
                 query_interrupted = True
                 break
 
             products, observations = extract_cheap_products_from_html(
-                html, query=query, lane=lane, niche=niche, page=page_num, run_id=session_id
+                html, query=query, lane=lane, niche=niche, page=page_num, run_id=session_id,
+                partition_type=part_type, partition_id=part_id,
+                min_price=min_p, max_price=max_p, strategy_used=strategy_used
             )
             asins_found_page = len(products)
             if asins_found_page == 0:
                 parser_partial += 1
-                db.update_query_progress(niche, query, page_num, status="failed", error="zero_products_parsed", success=False)
+                db.update_query_progress(
+                    niche, query, page_num, status="failed", error="zero_products_parsed",
+                    success=False, partition_type=part_type, partition_id=part_id
+                )
                 query_interrupted = True
                 break
 
@@ -673,7 +771,7 @@ def run_breadth_discovery_saturation_loop(
                 # Save candidate entity without bloating product_snapshots on every search card
                 db.save_product(p, record_snapshot=False)
 
-            # Record granular search observations for every card (Sponsored vs Organic with exact position)
+            # Record granular search observations for every card (Sponsored vs Organic with exact position & partition)
             for obs in observations:
                 db.record_search_observation(obs)
 
@@ -681,7 +779,10 @@ def run_breadth_discovery_saturation_loop(
             query_total_asins += asins_found_page
 
             # Update page progress in queue checkpoint
-            db.update_query_progress(niche, query, page_num, status="in_progress", success=True)
+            db.update_query_progress(
+                niche, query, page_num, status="in_progress", success=True,
+                partition_type=part_type, partition_id=part_id
+            )
 
             # Log entry to Coverage Ledger for this specific page
             db.record_coverage_ledger_entry(
@@ -695,16 +796,18 @@ def run_breadth_discovery_saturation_loop(
                 asins_duplicate=page_duplicates,
                 cumulative_unique=len(cumulative_unique),
                 status="success",
-                strategy_used=strategy_used
+                strategy_used=strategy_used,
+                partition_type=part_type,
+                partition_id=part_id
             )
 
             logger.info(f" -> [Page {page_num}] Found: {asins_found_page} | New: {page_new_unique} | Cumulative: {len(cumulative_unique)}")
 
-            # Robust Saturation Check: Require 2 consecutive zero-yield pages before breaking
+            # Intra-Partition Early Exit: Require 2 consecutive zero-yield pages before breaking this partition
             if page_new_unique == 0:
                 consecutive_zero_page_count += 1
                 if consecutive_zero_page_count >= 2:
-                    logger.info(f"[BreadthCrawler] 2 consecutive pages yielded 0 new unique ASINs. Stopping pagination for '{query}'.")
+                    logger.info(f"[BreadthCrawler] Intra-partition saturation: 2 consecutive pages yielded 0 new unique ASINs. Stopping slice '{query}' [{part_id}].")
                     break
             else:
                 consecutive_zero_page_count = 0
@@ -718,16 +821,17 @@ def run_breadth_discovery_saturation_loop(
 
         marginal_yield = round((query_new_asins / query_total_asins * 100), 2) if query_total_asins > 0 else 0.0
         if query_interrupted:
-            db.mark_discovery_query_status(niche, query, "failed", error=f"interrupted_on_page_{page_num}")
+            status_done = "paused_captcha" if failures_429 > 0 and status == "captcha" else "failed"
+            db.mark_discovery_query_status(niche, query, status_done, error=f"interrupted_on_page_{page_num}", partition_type=part_type, partition_id=part_id)
         else:
-            db.mark_discovery_query_status(niche, query, "completed")
+            db.mark_discovery_query_status(niche, query, "completed", partition_type=part_type, partition_id=part_id)
 
-        # Check Saturation condition
-        if query_total_asins >= 10 and marginal_yield < saturation_threshold_yield:
+        # Check Saturation condition (only for NORMAL lane, never kill entire crawl on a single price partition)
+        if part_type == "NORMAL" and query_total_asins >= 10 and marginal_yield < saturation_threshold_yield:
             consecutive_low_yield_count += 1
             if consecutive_low_yield_count >= 3:
                 logger.info(f"[BreadthCrawler] 🎯 DISCOVERY SATURATION REACHED! 3 consecutive queries yielded < {saturation_threshold_yield}%.")
-                db.mark_discovery_query_status(niche, query, "saturated")
+                db.mark_discovery_query_status(niche, query, "saturated", partition_type=part_type, partition_id=part_id)
                 break
         else:
             consecutive_low_yield_count = 0

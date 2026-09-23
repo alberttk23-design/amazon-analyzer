@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROFILE_DIR = BASE_DIR / "data" / "browser_profile"
+CDP_PROFILE_DIR = PROFILE_DIR / "cdp_research_profile"
 COOKIES_DB = PROFILE_DIR / "Default" / "Cookies"
 
 
@@ -218,11 +219,34 @@ def clear_session() -> Dict:
             except Exception:
                 pass
 
-    return {
-        "status": "cleared",
-        "message": f"Đã xóa sạch phiên đăng nhập ({len(deleted_items)} mục). Bạn có thể khởi tạo phiên mới!",
-        "cleared_items": deleted_items
-    }
+def is_cdp_available(port: int = 9222, timeout: float = 0.5) -> bool:
+    """
+    Checks if a local Chrome process is actively exposing Chrome DevTools Protocol on port.
+    Pings http://127.0.0.1:{port}/json/version.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/json/version")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def get_cdp_launch_command(port: int = 9222) -> str:
+    """
+    Returns the exact terminal launch command for macOS/Windows/Linux
+    using a dedicated research profile to satisfy Chrome 136+ security requirements.
+    """
+    CDP_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    p_str = str(CDP_PROFILE_DIR.resolve())
+
+    if sys.platform == "darwin":
+        return f'/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port={port} --user-data-dir="{p_str}" --no-first-run &'
+    elif sys.platform == "win32":
+        return f'start chrome.exe --remote-debugging-port={port} --user-data-dir="{p_str}" --no-first-run'
+    else:
+        return f'google-chrome --remote-debugging-port={port} --user-data-dir="{p_str}" --no-first-run &'
 
 
 if __name__ == "__main__":

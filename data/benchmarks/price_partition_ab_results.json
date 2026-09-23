@@ -1,0 +1,50 @@
+{
+  "benchmark_id": "43e06d7c",
+  "niche": "luggage",
+  "timestamp": "2026-09-23 15:50:36",
+  "arm_a_baseline": {
+    "total_asins": 272,
+    "core_asins": 253,
+    "accessory_asins": 4,
+    "adjacent_asins": 11,
+    "search_observations": 300,
+    "pages_requested": 6,
+    "runtime_seconds": 43.7
+  },
+  "arm_b_partitioned": {
+    "total_asins": 589,
+    "core_asins": 516,
+    "accessory_asins": 15,
+    "adjacent_asins": 39,
+    "search_observations": 948,
+    "pages_requested": 18,
+    "runtime_seconds": 129.04,
+    "duplicate_rate_pct": 37.87,
+    "slice_observations": {
+      "ALL": 948
+    },
+    "transports": {
+      "PLAYWRIGHT_PERSISTENT": 948
+    },
+    "sub_niche_clusters": [
+      "duffel bags",
+      "luggage covers",
+      "packing cubes",
+      "luggage locks",
+      "travel backpacks",
+      "garment bags",
+      "replacement parts",
+      "scales",
+      "tote bags"
+    ]
+  },
+  "incremental_delta": {
+    "net_unique_asins_gained": 322,
+    "net_core_asins_gained": 268,
+    "net_accessory_asins_gained": 11,
+    "net_adjacent_asins_gained": 28,
+    "net_observations_gained": 648,
+    "core_lift_pct": 103.95,
+    "total_lift_pct": 116.54
+  }
+}
