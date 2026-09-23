@@ -193,3 +193,14 @@ def test_transport_planner_cdp_helpers():
     assert "--remote-debugging-port=9222" in cmd
     assert "cdp_research_profile" in cmd
     assert "--user-data-dir=" in cmd
+
+
+def test_api_price_partition_request_models():
+    """Verify that AnalyzeRequest and BreadthDiscoverRequest support enable_price_partition."""
+    from backend.api import AnalyzeRequest, BreadthDiscoverRequest
+
+    req1 = AnalyzeRequest(keyword="luggage", enable_price_partition=True)
+    assert req1.enable_price_partition is True
+
+    req2 = BreadthDiscoverRequest(seed_keyword="luggage", enable_price_partition=True)
+    assert req2.enable_price_partition is True

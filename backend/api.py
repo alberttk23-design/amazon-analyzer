@@ -50,6 +50,7 @@ class AnalyzeRequest(BaseModel):
     target_folder: Optional[str] = None
     crawl_reviews: bool = True
     max_depth_candidates: int = 12
+    enable_price_partition: bool = False
 
 
 class BreadthDiscoverRequest(BaseModel):
@@ -57,6 +58,7 @@ class BreadthDiscoverRequest(BaseModel):
     target_niche: Optional[str] = None
     max_queries: int = 20
     saturation_threshold: float = 4.0
+    enable_price_partition: bool = False
 
 
 class DepthCrawlRequest(BaseModel):
@@ -128,7 +130,8 @@ def execute_amazon_pipeline(
     limit: int = 40,
     target_folder: Optional[str] = None,
     crawl_reviews: bool = True,
-    max_depth_candidates: int = 12
+    max_depth_candidates: int = 12,
+    enable_price_partition: bool = False
 ):
     """
     Acquisition-First 2-Tier Pipeline:
@@ -146,7 +149,8 @@ def execute_amazon_pipeline(
             seed_keyword=keyword,
             target_niche=pool_folder,
             max_queries=max(10, limit // 3),
-            job_id=job_id
+            job_id=job_id,
+            enable_price_partition=enable_price_partition
         )
 
         # Signal Evaluation & Promotion Engine
@@ -211,7 +215,8 @@ def start_analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
         limit=req.limit,
         target_folder=pool_name,
         crawl_reviews=req.crawl_reviews,
-        max_depth_candidates=req.max_depth_candidates
+        max_depth_candidates=req.max_depth_candidates,
+        enable_price_partition=req.enable_price_partition
     )
 
     return {
@@ -249,7 +254,8 @@ def run_breadth_discovery(req: BreadthDiscoverRequest, background_tasks: Backgro
                 target_niche=pool_name,
                 max_queries=req.max_queries,
                 saturation_threshold_yield=req.saturation_threshold,
-                job_id=job_id
+                job_id=job_id,
+                enable_price_partition=req.enable_price_partition
             )
             promotion_engine.compute_and_update_niche_promotions(pool_name)
             db.update_job(job_id, status="completed", progress=100, message="Cào rộng đa làn hoàn tất!")
