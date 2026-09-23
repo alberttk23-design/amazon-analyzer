@@ -155,18 +155,82 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_niche ON coverage_ledger(niche)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ledger_session ON coverage_ledger(session_id)")
 
-    # 4. Discovery Query Queue (Multi-lane expansion queue)
+    # 3.1 Niche Products Junction Table (Entity & Membership Decoupled)
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS discovery_query_queue (
+    CREATE TABLE IF NOT EXISTS niche_products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        niche TEXT,
-        lane TEXT,
-        query TEXT UNIQUE,
-        status TEXT DEFAULT 'pending',       -- 'pending', 'in_progress', 'completed', 'saturated', 'failed'
-        priority INTEGER DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        niche TEXT NOT NULL,
+        asin TEXT NOT NULL,
+        tier TEXT DEFAULT 'COLD',
+        tier_reason TEXT DEFAULT 'initial_discovery',
+        discovery_lane TEXT DEFAULT 'keyword_search',
+        discovered_via_query TEXT DEFAULT '',
+        score REAL DEFAULT 0.0,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(niche, asin)
     )
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_niche ON niche_products(niche)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_asin ON niche_products(asin)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_niche_prod_tier ON niche_products(niche, tier)")
+
+    # Auto-populate niche_products from products if empty
+    cursor.execute("SELECT COUNT(*) FROM niche_products")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("""
+        INSERT OR IGNORE INTO niche_products (niche, asin, tier, tier_reason, discovery_lane, discovered_via_query, score, added_at, updated_at)
+        SELECT keyword, asin, tier, tier_reason, discovery_lane, discovered_via_query, score, created_at, updated_at
+        FROM products
+        WHERE keyword IS NOT NULL AND length(keyword) > 0
+        """)
+
+    # 3.2 Product Variations Table (Explicit Parent/Child Dimension Mapping)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS product_variations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parent_asin TEXT NOT NULL,
+        child_asin TEXT NOT NULL,
+        dimensions_json TEXT DEFAULT '{}',
+        price REAL DEFAULT 0.0,
+        availability TEXT DEFAULT 'UNKNOWN',
+        image_url TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(parent_asin, child_asin)
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_variant_parent ON product_variations(parent_asin)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_variant_child ON product_variations(child_asin)")
+
+    # 4. Discovery Query Queue (Multi-lane expansion & page-level checkpoint)
+    cursor.execute("PRAGMA table_info(discovery_query_queue)")
+    q_cols = {row[1] for row in cursor.fetchall()}
+    if "next_page" not in q_cols:
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS discovery_query_queue_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            niche TEXT NOT NULL,
+            lane TEXT DEFAULT 'keyword_search',
+            query TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            priority INTEGER DEFAULT 1,
+            target_pages INTEGER DEFAULT 3,
+            last_completed_page INTEGER DEFAULT 0,
+            next_page INTEGER DEFAULT 1,
+            retry_count INTEGER DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(niche, query)
+        )
+        """)
+        cursor.execute("""
+        INSERT OR IGNORE INTO discovery_query_queue_v2 (id, niche, lane, query, status, priority, created_at)
+        SELECT id, niche, lane, query, status, priority, created_at FROM discovery_query_queue
+        """)
+        cursor.execute("DROP TABLE discovery_query_queue")
+        cursor.execute("ALTER TABLE discovery_query_queue_v2 RENAME TO discovery_query_queue")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_query_queue ON discovery_query_queue(niche, status)")
 
     # 5. Customer Reviews table
@@ -404,13 +468,17 @@ def get_existing_asins(keyword: Optional[str] = None) -> Tuple[set, set]:
     conn = get_db()
     cursor = conn.cursor()
     if keyword:
-        cursor.execute("SELECT asin, url FROM products WHERE keyword = ?", (keyword,))
+        cursor.execute("SELECT p.asin, p.url FROM products p JOIN niche_products np ON p.asin = np.asin WHERE np.niche = ?", (keyword,))
+        rows = cursor.fetchall()
+        if not rows:
+            cursor.execute("SELECT asin, url FROM products WHERE keyword = ?", (keyword,))
+            rows = cursor.fetchall()
     else:
         cursor.execute("SELECT asin, url FROM products")
-    rows = cursor.fetchall()
+        rows = cursor.fetchall()
     conn.close()
     asins = {r["asin"] for r in rows if r["asin"]}
-    urls = {r["url"] for r in rows if r["url"]}
+    urls = {r["url"] for r in rows if "url" in r.keys() and r["url"]}
     return asins, urls
 
 
@@ -477,29 +545,52 @@ def save_product(p: Dict[str, Any], record_snapshot: bool = True) -> bool:
             title=CASE WHEN length(excluded.title) > 0 THEN excluded.title ELSE products.title END,
             brand=CASE WHEN length(excluded.brand) > 0 THEN excluded.brand ELSE products.brand END,
             seller=CASE WHEN length(excluded.seller) > 0 THEN excluded.seller ELSE products.seller END,
-            price=excluded.price,
-            original_price=excluded.original_price,
-            rating=excluded.rating,
-            reviews_count=excluded.reviews_count,
-            bought_past_month=excluded.bought_past_month,
+            price=CASE 
+                WHEN excluded.product_depth = 'FULL' AND excluded.price > 0 THEN excluded.price
+                WHEN products.price > 0 THEN products.price
+                WHEN excluded.price > 0 THEN excluded.price
+                ELSE products.price
+            END,
+            original_price=CASE 
+                WHEN excluded.product_depth = 'FULL' AND excluded.original_price > 0 THEN excluded.original_price
+                WHEN products.original_price > 0 THEN products.original_price
+                WHEN excluded.original_price > 0 THEN excluded.original_price
+                ELSE products.original_price
+            END,
+            rating=CASE 
+                WHEN excluded.product_depth = 'FULL' AND excluded.rating > 0 THEN excluded.rating
+                WHEN products.rating > 0 THEN products.rating
+                WHEN excluded.rating > 0 THEN excluded.rating
+                ELSE products.rating
+            END,
+            reviews_count=CASE 
+                WHEN excluded.product_depth = 'FULL' AND excluded.reviews_count > 0 THEN excluded.reviews_count
+                WHEN products.reviews_count > 0 THEN products.reviews_count
+                WHEN excluded.reviews_count > 0 THEN excluded.reviews_count
+                ELSE products.reviews_count
+            END,
+            bought_past_month=CASE WHEN excluded.bought_past_month > 0 THEN excluded.bought_past_month ELSE products.bought_past_month END,
             bsr_rank=CASE WHEN excluded.bsr_rank > 0 THEN excluded.bsr_rank ELSE products.bsr_rank END,
-            bsr_category=excluded.bsr_category,
+            bsr_category=CASE WHEN length(excluded.bsr_category) > 0 THEN excluded.bsr_category ELSE products.bsr_category END,
             is_sponsored=excluded.is_sponsored,
-            is_best_seller=excluded.is_best_seller,
-            is_amazons_choice=excluded.is_amazons_choice,
+            is_best_seller=CASE WHEN excluded.is_best_seller = 1 THEN 1 ELSE products.is_best_seller END,
+            is_amazons_choice=CASE WHEN excluded.is_amazons_choice = 1 THEN 1 ELSE products.is_amazons_choice END,
             prime_eligible=excluded.prime_eligible,
             image_url=CASE WHEN length(excluded.image_url) > 0 THEN excluded.image_url ELSE products.image_url END,
             score=CASE WHEN excluded.score > 0 THEN excluded.score ELSE products.score END,
-            tier=:tier,
+            tier=CASE WHEN excluded.tier != 'COLD' THEN excluded.tier ELSE products.tier END,
+            tier_reason=CASE WHEN excluded.tier != 'COLD' THEN excluded.tier_reason ELSE products.tier_reason END,
+            product_depth=CASE WHEN products.product_depth = 'FULL' THEN 'FULL' ELSE excluded.product_depth END,
+            availability=CASE WHEN excluded.availability != 'UNKNOWN' THEN excluded.availability ELSE products.availability END,
             last_observed_at=CURRENT_TIMESTAMP,
             previous_price=:previous_price,
             price_delta=:price_delta,
             previous_reviews_count=:previous_reviews_count,
             review_velocity=:review_velocity,
-            parent_asin=COALESCE(excluded.parent_asin, products.parent_asin),
-            is_parent=COALESCE(excluded.is_parent, products.is_parent),
-            variation_dimensions_json=COALESCE(excluded.variation_dimensions_json, products.variation_dimensions_json),
-            child_asins_json=COALESCE(excluded.child_asins_json, products.child_asins_json),
+            parent_asin=CASE WHEN length(excluded.parent_asin) > 0 THEN excluded.parent_asin ELSE products.parent_asin END,
+            is_parent=CASE WHEN excluded.is_parent = 1 THEN 1 ELSE products.is_parent END,
+            variation_dimensions_json=CASE WHEN length(excluded.variation_dimensions_json) > 2 THEN excluded.variation_dimensions_json ELSE products.variation_dimensions_json END,
+            child_asins_json=CASE WHEN length(excluded.child_asins_json) > 2 THEN excluded.child_asins_json ELSE products.child_asins_json END,
             completeness_status=COALESCE(excluded.completeness_status, products.completeness_status),
             visible_total_reviews=CASE WHEN excluded.visible_total_reviews > 0 THEN excluded.visible_total_reviews ELSE products.visible_total_reviews END,
             reviews_collected=CASE WHEN excluded.reviews_collected > 0 THEN excluded.reviews_collected ELSE products.reviews_collected END,
@@ -542,7 +633,7 @@ def save_product(p: Dict[str, Any], record_snapshot: bool = True) -> bool:
             "review_velocity": float(p.get("review_velocity") or rev_delta),
             "promotion_score": float(p.get("promotion_score") or 0.0),
             "variant_count": int(p.get("variant_count") or 1),
-            "availability": p.get("availability") or "In Stock",
+            "availability": p.get("availability") or "UNKNOWN",
             "parent_asin": p.get("parent_asin") or "",
             "is_parent": int(p.get("is_parent") or 0),
             "variation_dimensions_json": json.dumps(p.get("variation_dimensions") or {}, ensure_ascii=False) if isinstance(p.get("variation_dimensions"), dict) else (p.get("variation_dimensions_json") or "{}"),
@@ -556,22 +647,52 @@ def save_product(p: Dict[str, Any], record_snapshot: bool = True) -> bool:
             "raw_json": raw_json
         })
 
+        # Multi-niche membership persistence (Decouple canonical entity from niche)
+        niche_name = p.get("keyword") or "default"
+        cursor.execute("""
+        INSERT INTO niche_products (
+            niche, asin, tier, tier_reason, discovery_lane, discovered_via_query, score, updated_at
+        ) VALUES (
+            :niche, :asin, :tier, :tier_reason, :discovery_lane, :discovered_via_query, :score, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(niche, asin) DO UPDATE SET
+            tier = CASE WHEN excluded.tier != 'COLD' THEN excluded.tier ELSE niche_products.tier END,
+            tier_reason = CASE WHEN excluded.tier != 'COLD' THEN excluded.tier_reason ELSE niche_products.tier_reason END,
+            score = CASE WHEN excluded.score > 0 THEN excluded.score ELSE niche_products.score END,
+            updated_at = CURRENT_TIMESTAMP
+        """, {
+            "niche": niche_name,
+            "asin": asin,
+            "tier": incoming_tier,
+            "tier_reason": p.get("tier_reason") or "initial_discovery",
+            "discovery_lane": p.get("discovery_lane") or "keyword_search",
+            "discovered_via_query": p.get("discovered_via_query") or "",
+            "score": float(p.get("score") or 0.0)
+        })
+
         if record_snapshot:
+            # Throttle snapshot: only 1 snapshot per ASIN per 6 hours to prevent massive duplicate rows
             cursor.execute("""
-            INSERT INTO product_snapshots (
-                asin, keyword, price, rating, reviews_count,
-                bought_past_month, bsr_rank, is_sponsored, observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (
-                asin,
-                p.get("keyword") or "default",
-                new_price,
-                float(p.get("rating") or 0.0),
-                new_revs,
-                int(p.get("bought_past_month") or 0),
-                int(p.get("bsr_rank") or 0),
-                1 if p.get("is_sponsored") else 0
-            ))
+            SELECT id FROM product_snapshots 
+            WHERE asin = ? AND datetime(observed_at) >= datetime('now', '-6 hours')
+            LIMIT 1
+            """, (asin,))
+            if not cursor.fetchone():
+                cursor.execute("""
+                INSERT INTO product_snapshots (
+                    asin, keyword, price, rating, reviews_count,
+                    bought_past_month, bsr_rank, is_sponsored, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (
+                    asin,
+                    niche_name,
+                    new_price,
+                    float(p.get("rating") or 0.0),
+                    new_revs,
+                    int(p.get("bought_past_month") or 0),
+                    int(p.get("bsr_rank") or 0),
+                    1 if p.get("is_sponsored") else 0
+                ))
 
         conn.commit()
         return True
@@ -590,7 +711,7 @@ def batch_save_products(products: List[Dict[str, Any]], record_snapshot: bool = 
     return saved
 
 
-def update_product_tier(asin: str, new_tier: str, reason: str = "", promotion_score: float = None) -> bool:
+def update_product_tier(asin: str, new_tier: str, reason: str = "", promotion_score: float = None, niche: Optional[str] = None) -> bool:
     """Promote or transition product lifecycle tier (COLD -> WARM -> HOT)."""
     conn = get_db()
     cursor = conn.cursor()
@@ -603,6 +724,17 @@ def update_product_tier(asin: str, new_tier: str, reason: str = "", promotion_sc
         sql += " WHERE asin = ?"
         params.append(asin)
         cursor.execute(sql, tuple(params))
+
+        if niche:
+            n_sql = "UPDATE niche_products SET tier = ?, tier_reason = ?, updated_at = CURRENT_TIMESTAMP"
+            n_params = [new_tier, reason]
+            if promotion_score is not None:
+                n_sql += ", score = ?"
+                n_params.append(promotion_score)
+            n_sql += " WHERE asin = ? AND niche = ?"
+            n_params.extend([asin, niche])
+            cursor.execute(n_sql, tuple(n_params))
+
         conn.commit()
         return True
     except Exception as e:
@@ -634,49 +766,77 @@ def get_products(
     conn = get_db()
     cursor = conn.cursor()
 
-    sql = "SELECT * FROM products WHERE 1=1"
     params = []
-
     if keyword:
-        sql += " AND keyword = ?"
+        sql = """
+        SELECT p.*,
+               np.tier as niche_tier,
+               np.tier_reason as niche_tier_reason,
+               np.discovery_lane as niche_discovery_lane,
+               np.discovered_via_query as niche_discovered_via_query,
+               np.score as niche_score,
+               np.niche
+        FROM products p
+        JOIN niche_products np ON p.asin = np.asin
+        WHERE np.niche = ?
+        """
         params.append(keyword)
 
-    if tier:
-        sql += " AND tier = ?"
-        params.append(tier)
+        if tier:
+            sql += " AND np.tier = ?"
+            params.append(tier)
 
-    if discovery_lane:
-        sql += " AND discovery_lane = ?"
-        params.append(discovery_lane)
+        if discovery_lane:
+            sql += " AND np.discovery_lane = ?"
+            params.append(discovery_lane)
+    else:
+        sql = "SELECT p.* FROM products p WHERE 1=1"
+        if tier:
+            sql += " AND p.tier = ?"
+            params.append(tier)
+        if discovery_lane:
+            sql += " AND p.discovery_lane = ?"
+            params.append(discovery_lane)
 
     if min_rating is not None:
-        sql += " AND rating >= ?"
+        sql += " AND p.rating >= ?"
         params.append(min_rating)
 
     if is_sponsored is not None:
-        sql += " AND is_sponsored = ?"
+        sql += " AND p.is_sponsored = ?"
         params.append(is_sponsored)
 
     allowed_sorts = {
-        "score DESC": "score DESC",
-        "bought_past_month DESC": "bought_past_month DESC",
-        "rating DESC": "rating DESC",
-        "reviews_count DESC": "reviews_count DESC",
-        "price ASC": "price ASC",
-        "price DESC": "price DESC",
-        "bsr_rank ASC": "bsr_rank ASC",
-        "promotion_score DESC": "promotion_score DESC",
-        "review_velocity DESC": "review_velocity DESC",
-        "created_at DESC": "created_at DESC"
+        "score DESC": "COALESCE(np.score, p.score) DESC" if keyword else "p.score DESC",
+        "bought_past_month DESC": "p.bought_past_month DESC",
+        "rating DESC": "p.rating DESC",
+        "reviews_count DESC": "p.reviews_count DESC",
+        "price ASC": "p.price ASC",
+        "price DESC": "p.price DESC",
+        "bsr_rank ASC": "p.bsr_rank ASC",
+        "promotion_score DESC": "p.promotion_score DESC",
+        "review_velocity DESC": "p.review_velocity DESC",
+        "created_at DESC": "p.created_at DESC"
     }
-    order_clause = allowed_sorts.get(sort_by, "score DESC")
+    order_clause = allowed_sorts.get(sort_by, "COALESCE(np.score, p.score) DESC" if keyword else "p.score DESC")
     sql += f" ORDER BY {order_clause} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
     cursor.execute(sql, tuple(params))
     rows = cursor.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        if keyword:
+            d["tier"] = d.pop("niche_tier", d.get("tier"))
+            d["tier_reason"] = d.pop("niche_tier_reason", d.get("tier_reason"))
+            d["discovery_lane"] = d.pop("niche_discovery_lane", d.get("discovery_lane"))
+            d["discovered_via_query"] = d.pop("niche_discovered_via_query", d.get("discovered_via_query"))
+            d["score"] = d.pop("niche_score", d.get("score"))
+        result.append(d)
+    return result
 
 
 def get_candidate_universe_summary(keyword: str) -> Dict[str, Any]:
@@ -687,22 +847,23 @@ def get_candidate_universe_summary(keyword: str) -> Dict[str, Any]:
     cursor.execute("""
         SELECT 
             COUNT(*) as total_candidates,
-            SUM(CASE WHEN tier = 'COLD' THEN 1 ELSE 0 END) as cold_count,
-            SUM(CASE WHEN tier = 'WARM' THEN 1 ELSE 0 END) as warm_count,
-            SUM(CASE WHEN tier = 'HOT' THEN 1 ELSE 0 END) as hot_count,
-            AVG(price) as avg_price,
-            AVG(rating) as avg_rating,
-            SUM(bought_past_month) as total_monthly_sales
-        FROM products
-        WHERE keyword = ?
+            SUM(CASE WHEN np.tier = 'COLD' THEN 1 ELSE 0 END) as cold_count,
+            SUM(CASE WHEN np.tier = 'WARM' THEN 1 ELSE 0 END) as warm_count,
+            SUM(CASE WHEN np.tier = 'HOT' THEN 1 ELSE 0 END) as hot_count,
+            AVG(p.price) as avg_price,
+            AVG(p.rating) as avg_rating,
+            SUM(p.bought_past_month) as total_monthly_sales
+        FROM products p
+        JOIN niche_products np ON p.asin = np.asin
+        WHERE np.niche = ?
     """, (keyword,))
     summary_row = cursor.fetchone()
 
     cursor.execute("""
-        SELECT discovery_lane, COUNT(*) as count
-        FROM products
-        WHERE keyword = ?
-        GROUP BY discovery_lane
+        SELECT np.discovery_lane, COUNT(*) as count
+        FROM niche_products np
+        WHERE np.niche = ?
+        GROUP BY np.discovery_lane
     """, (keyword,))
     lane_rows = cursor.fetchall()
 
@@ -900,7 +1061,7 @@ def save_reviews(
                 r.get("review_title") or "",
                 r.get("review_text") or "",
                 r.get("review_date") or "",
-                1 if r.get("verified_purchase", True) else 0,
+                1 if r.get("verified_purchase", False) else 0,
                 int(r.get("helpful_votes") or 0),
                 r.get("variant_reviewed") or "",
                 sentiment,
@@ -918,7 +1079,15 @@ def save_reviews(
         coverage_pct = round((len(reviews_list) / max(1, vt)) * 100, 2)
         coverage_str = f"{len(reviews_list)}/{vt} ({coverage_pct}%)"
         filters_str = json.dumps(filters_applied or ["critical_1_3_star", "positive_5_star"])
-        depth_label = collection_method.upper()
+        
+        target_map = {"discovery_sample": 10, "representative_polarity": 30, "deep_hot_crawl": 60}
+        target_for_policy = target_map.get(collection_method, 30)
+        if len(reviews_list) >= target_for_policy or (vt > 0 and len(reviews_list) >= vt):
+            depth_status = "FULL"
+        elif len(reviews_list) > 0:
+            depth_status = "PARTIAL"
+        else:
+            depth_status = "NONE"
 
         cursor.execute("""
         UPDATE products SET
@@ -931,7 +1100,7 @@ def save_reviews(
             tier = 'HOT',
             updated_at = CURRENT_TIMESTAMP
         WHERE asin = ?
-        """, (vt, len(reviews_list), collection_method, coverage_str, filters_str, depth_label, asin))
+        """, (vt, len(reviews_list), collection_method, coverage_str, filters_str, depth_status, asin))
 
     conn.commit()
     conn.close()
@@ -1782,22 +1951,39 @@ def get_recent_diagnostics(niche: Optional[str] = None, limit: int = 50) -> List
     return [dict(r) for r in rows]
 
 
-def enqueue_discovery_queries(niche: str, queries: List[Tuple[str, str, int]]) -> int:
+def enqueue_discovery_queries(
+    niche: str,
+    queries: List[Any],
+    target_pages: int = 3
+) -> int:
     """
-    Enqueue queries into discovery_query_queue.
-    queries: List of (lane, query, priority)
-    Ignores queries already existing in queue for this niche.
+    Enqueue queries into discovery_query_queue with composite UNIQUE(niche, query).
+    queries: List of (lane, query, priority) or (lane, query, priority, target_pages) or simple str queries.
     """
     conn = get_db()
     cursor = conn.cursor()
     enqueued = 0
-    for lane, query, priority in queries:
+    for item in queries:
+        if isinstance(item, str):
+            lane, query, priority, tp = "keyword_search", item, 10, target_pages
+        elif isinstance(item, (tuple, list)):
+            if len(item) == 2:
+                lane, query, priority, tp = item[0], item[1], 10, target_pages
+            elif len(item) == 3:
+                lane, query, priority, tp = item[0], item[1], item[2], target_pages
+            elif len(item) >= 4:
+                lane, query, priority, tp = item[0], item[1], item[2], item[3]
+            else:
+                continue
+        else:
+            continue
+
         try:
             cursor.execute("""
-            INSERT INTO discovery_query_queue (niche, lane, query, status, priority)
-            VALUES (?, ?, ?, 'pending', ?)
-            ON CONFLICT(query) DO NOTHING
-            """, (niche, lane, query, priority))
+            INSERT INTO discovery_query_queue (niche, lane, query, status, priority, target_pages, last_completed_page, next_page)
+            VALUES (?, ?, ?, 'pending', ?, ?, 0, 1)
+            ON CONFLICT(niche, query) DO NOTHING
+            """, (niche, lane, query, priority, tp))
             if cursor.rowcount > 0:
                 enqueued += 1
         except Exception:
@@ -1811,7 +1997,7 @@ def get_pending_discovery_queries(niche: str, limit: int = 100) -> List[Dict[str
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT id, niche, lane, query, status, priority, created_at
+    SELECT id, niche, lane, query, status, priority, target_pages, last_completed_page, next_page, retry_count, last_error, created_at
     FROM discovery_query_queue
     WHERE niche = ? AND status = 'pending'
     ORDER BY priority ASC, id ASC
@@ -1822,18 +2008,74 @@ def get_pending_discovery_queries(niche: str, limit: int = 100) -> List[Dict[str
     return [dict(r) for r in rows]
 
 
-def mark_discovery_query_status(niche: str, query: str, status: str) -> bool:
+def get_next_pending_query(niche: str) -> Optional[Dict[str, Any]]:
+    """Pops the next pending discovery query for this niche based on priority."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, niche, lane, query, status, priority, target_pages, last_completed_page, next_page, retry_count, last_error
+    FROM discovery_query_queue
+    WHERE niche = ? AND status = 'pending'
+    ORDER BY priority ASC, id ASC
+    LIMIT 1
+    """, (niche,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_query_progress(niche: str, query: str, page_num: int, status: str = 'in_progress', error: str = '') -> bool:
+    """Update page-level progress in discovery_query_queue for exact recovery."""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
     UPDATE discovery_query_queue
-    SET status = ?
+    SET status = ?,
+        last_completed_page = ?,
+        next_page = ?,
+        last_error = ?,
+        updated_at = CURRENT_TIMESTAMP
     WHERE niche = ? AND query = ?
-    """, (status, niche, query))
+    """, (status, page_num, page_num + 1, error, niche, query))
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()
     return updated
+
+
+def mark_discovery_query_status(niche: str, query: str, status: str, error: str = '') -> bool:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE discovery_query_queue
+    SET status = ?,
+        last_error = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE niche = ? AND query = ?
+    """, (status, error, niche, query))
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def reclaim_stale_in_progress_queries(niche: str, timeout_minutes: int = 15) -> int:
+    """Reclaim queries stuck in 'in_progress' after process crash or forced interruption."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE discovery_query_queue
+    SET status = 'pending',
+        retry_count = retry_count + 1,
+        last_error = 'reclaimed_stale_in_progress',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE niche = ? AND status = 'in_progress'
+      AND (strftime('%s', 'now') - strftime('%s', updated_at)) > (? * 60)
+    """, (niche, timeout_minutes))
+    reclaimed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return reclaimed
 
 
 def get_query_queue_checkpoint(niche: str) -> Dict[str, Any]:
@@ -1844,6 +2086,7 @@ def get_query_queue_checkpoint(niche: str) -> Dict[str, Any]:
         COUNT(*) as total_queries,
         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_queries,
         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_queries,
+        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_queries,
         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_queries,
         SUM(CASE WHEN status = 'saturated' THEN 1 ELSE 0 END) as saturated_queries
     FROM discovery_query_queue
@@ -1859,9 +2102,101 @@ def get_query_queue_checkpoint(niche: str) -> Dict[str, Any]:
         "total_queries": total,
         "completed_queries": comp,
         "pending_queries": r.get("pending_queries") or 0,
+        "in_progress_queries": r.get("in_progress_queries") or 0,
         "failed_queries": r.get("failed_queries") or 0,
         "saturated_queries": r.get("saturated_queries") or 0,
         "progress_percent": round((comp / total * 100), 1) if total > 0 else 0.0
+    }
+
+
+# ---------------------------------------------------------
+# Product Variations & Observation Metrics Helpers
+# ---------------------------------------------------------
+
+def save_product_variation(
+    parent_asin: str,
+    child_asin: str,
+    dimensions: Dict[str, Any],
+    price: float = 0.0,
+    availability: str = "UNKNOWN",
+    image_url: str = ""
+) -> bool:
+    """Stores explicit attribute mapping: child_asin -> {Color: Blue, Size: L}."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        dim_str = json.dumps(dimensions or {}, ensure_ascii=False)
+        cursor.execute("""
+        INSERT INTO product_variations (
+            parent_asin, child_asin, dimensions_json, price, availability, image_url, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(parent_asin, child_asin) DO UPDATE SET
+            dimensions_json = excluded.dimensions_json,
+            price = CASE WHEN excluded.price > 0 THEN excluded.price ELSE product_variations.price END,
+            availability = CASE WHEN excluded.availability != 'UNKNOWN' THEN excluded.availability ELSE product_variations.availability END,
+            image_url = CASE WHEN length(excluded.image_url) > 0 THEN excluded.image_url ELSE product_variations.image_url END,
+            updated_at = CURRENT_TIMESTAMP
+        """, (parent_asin, child_asin, dim_str, price, availability, image_url))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB Error] save_product_variation {parent_asin} -> {child_asin}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_product_variations(parent_asin: str) -> List[Dict[str, Any]]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT pv.*, p.title, p.rating, p.reviews_count
+    FROM product_variations pv
+    LEFT JOIN products p ON pv.child_asin = p.asin
+    WHERE pv.parent_asin = ?
+    ORDER BY pv.child_asin ASC
+    """, (parent_asin,))
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["dimensions"] = json.loads(d.get("dimensions_json") or "{}")
+        except Exception:
+            d["dimensions"] = {}
+        result.append(d)
+    return result
+
+
+def get_asin_observation_metrics(asin: str, niche: str) -> Dict[str, Any]:
+    """Granular observation statistics from search_observations for Promotion Engine."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT 
+        COUNT(*) as total_observations,
+        SUM(CASE WHEN placement_type = 'SPONSORED' THEN 1 ELSE 0 END) as sponsored_seen_count,
+        COUNT(DISTINCT CASE WHEN placement_type = 'SPONSORED' THEN query END) as sponsored_query_count,
+        MIN(CASE WHEN placement_type = 'ORGANIC' THEN position END) as organic_best_position,
+        COUNT(DISTINCT CASE WHEN placement_type = 'ORGANIC' THEN query END) as organic_query_coverage
+    FROM search_observations
+    WHERE asin = ? AND niche = ?
+    """, (asin, niche))
+    row = cursor.fetchone()
+    conn.close()
+    r = dict(row) if row else {}
+    tot = r.get("total_observations") or 0
+    spon = r.get("sponsored_seen_count") or 0
+    return {
+        "asin": asin,
+        "niche": niche,
+        "total_observations": tot,
+        "sponsored_seen_count": spon,
+        "sponsored_query_count": r.get("sponsored_query_count") or 0,
+        "sponsored_share": round(spon / tot, 2) if tot > 0 else 0.0,
+        "organic_best_position": r.get("organic_best_position"),
+        "organic_query_coverage": r.get("organic_query_coverage") or 0
     }
 
 

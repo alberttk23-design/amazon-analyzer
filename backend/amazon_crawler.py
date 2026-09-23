@@ -276,7 +276,7 @@ def crawl_amazon_products(keyword: str, target_count: int = 20, job_id: str = No
 
                 price = parse_price(raw.get("priceText"))
                 orig_price = parse_price(raw.get("origPriceText")) or price
-                rating = parse_rating(raw.get("ratingText")) or 4.2
+                rating = parse_rating(raw.get("ratingText")) or 0.0
                 reviews_cnt = parse_count(raw.get("reviewsText"))
                 bought_month = parse_bought_past_month(raw.get("boughtText"))
                 is_bs = bool(raw.get("isBestSeller"))
@@ -295,9 +295,9 @@ def crawl_amazon_products(keyword: str, target_count: int = 20, job_id: str = No
                     "asin": asin,
                     "url": raw.get("url") or f"https://www.amazon.com/dp/{asin}",
                     "keyword": pool_keyword,
-                    "title": raw.get("title") or f"Amazon Product {asin}",
+                    "title": raw.get("title") or "",
                     "brand": raw.get("brand") or "",
-                    "seller": raw.get("brand") or "Amazon Seller",
+                    "seller": raw.get("seller") or "",
                     "price": price,
                     "original_price": orig_price,
                     "currency": "USD",

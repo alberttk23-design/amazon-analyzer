@@ -45,6 +45,31 @@ def parse_helpful_votes(text: str) -> int:
     return 0
 
 
+def parse_visible_review_count(text: str) -> int:
+    """Extract total review count from 'Showing 1-10 of 1,245 reviews' or header text."""
+    if not text:
+        return 0
+    m = re.search(r"of\s+([\d,]+)\s+(?:global\s+)?reviews?", text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    m = re.search(r"([\d,]+)\s+with\s+reviews?", text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    m = re.search(r"([\d,]+)\s+total\s+ratings?", text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return 0
+
+
 def crawl_amazon_reviews_for_asin(
     asin: str,
     keyword: str,
@@ -74,19 +99,20 @@ def crawl_amazon_reviews_for_asin(
         target_crit = max_critical
         target_pos = max_positive
 
-    collected_reviews = []
-    own_context = False
-
-    def scrape_review_page(page, url: str, expected_sentiment: str) -> List[Dict[str, Any]]:
+    def scrape_review_page(page, url: str, expected_sentiment: str):
         page_reviews = []
+        visible_count = 0
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=35000)
             page.wait_for_timeout(2000)
             page.evaluate("window.scrollBy(0, 1200)")
             page.wait_for_timeout(1000)
 
-            raw_cards = page.evaluate("""() => {
+            eval_res = page.evaluate("""() => {
                 const list = [];
+                const filterInfoEl = document.querySelector('div[data-hook="cr-filter-info-review-rating-count"], #filter-info-section, [data-hook="total-review-count"]');
+                const filterInfoText = filterInfoEl ? filterInfoEl.innerText.trim() : '';
+
                 const cards = document.querySelectorAll('div[data-hook="review"]');
                 cards.forEach(el => {
                     const id = el.getAttribute('id') || '';
@@ -128,8 +154,11 @@ def crawl_amazon_reviews_for_asin(
                         });
                     }
                 });
-                return list;
+                return { cards: list, filterInfoText };
             }""")
+
+            raw_cards = eval_res.get("cards", [])
+            visible_count = parse_visible_review_count(eval_res.get("filterInfoText", ""))
 
             for item in raw_cards:
                 stars = parse_star_rating(item.get("starsText"))
@@ -143,7 +172,7 @@ def crawl_amazon_reviews_for_asin(
                     "review_title": item.get("title") or "",
                     "review_text": item.get("text") or "",
                     "review_date": item.get("dateText") or "",
-                    "verified_purchase": item.get("isVerified", True),
+                    "verified_purchase": bool(item.get("isVerified")),
                     "helpful_votes": votes,
                     "variant_reviewed": item.get("variant") or "",
                     "sentiment": expected_sentiment
@@ -152,33 +181,62 @@ def crawl_amazon_reviews_for_asin(
         except Exception as e:
             print(f"[ReviewCrawler] Notice scraping {url}: {e}")
 
-        return page_reviews
+        return page_reviews, visible_count
 
     def execute_with_page(page):
+        total_visible_found = 0
+
         # 1. Critical Reviews (1-3 stars)
-        crit_url = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=critical&pageNumber=1&sortBy=recent"
-        crit_reviews = scrape_review_page(page, crit_url, "critical")
-        if len(crit_reviews) < target_crit:
-            crit_url_p2 = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=critical&pageNumber=2&sortBy=recent"
-            crit_reviews.extend(scrape_review_page(page, crit_url_p2, "critical"))
-        if len(crit_reviews) < target_crit and target_crit > 20:
-            crit_url_p3 = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=critical&pageNumber=3&sortBy=recent"
-            crit_reviews.extend(scrape_review_page(page, crit_url_p3, "critical"))
+        crit_reviews = []
+        seen_crit_ids = set()
+        max_crit_pages = max(1, (target_crit + 9) // 10)
+        for p_num in range(1, max_crit_pages + 2):
+            if len(crit_reviews) >= target_crit:
+                break
+            crit_url = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=critical&pageNumber={p_num}&sortBy=recent"
+            page_revs, vis_count = scrape_review_page(page, crit_url, "critical")
+            if vis_count and not total_visible_found:
+                total_visible_found = vis_count
+            new_added = 0
+            for r in page_revs:
+                if r["review_id"] not in seen_crit_ids:
+                    seen_crit_ids.add(r["review_id"])
+                    crit_reviews.append(r)
+                    new_added += 1
+                    if len(crit_reviews) >= target_crit:
+                        break
+            if new_added == 0:
+                break
+            time.sleep(random.uniform(0.3, 0.6))
 
         # 2. Positive Reviews (5 stars)
-        pos_url = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=positive&pageNumber=1&sortBy=helpful"
-        pos_reviews = scrape_review_page(page, pos_url, "positive")
-        if len(pos_reviews) < target_pos:
-            pos_url_p2 = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=positive&pageNumber=2&sortBy=helpful"
-            pos_reviews.extend(scrape_review_page(page, pos_url_p2, "positive"))
-        if len(pos_reviews) < target_pos and target_pos > 20:
-            pos_url_p3 = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=positive&pageNumber=3&sortBy=helpful"
-            pos_reviews.extend(scrape_review_page(page, pos_url_p3, "positive"))
+        pos_reviews = []
+        seen_pos_ids = set()
+        max_pos_pages = max(1, (target_pos + 9) // 10)
+        for p_num in range(1, max_pos_pages + 2):
+            if len(pos_reviews) >= target_pos:
+                break
+            pos_url = f"https://www.amazon.com/product-reviews/{asin}/ref=cm_cr_arp_d_viewopt_sr?filterByStar=positive&pageNumber={p_num}&sortBy=helpful"
+            page_revs, vis_count = scrape_review_page(page, pos_url, "positive")
+            if vis_count and not total_visible_found:
+                total_visible_found = vis_count
+            new_added = 0
+            for r in page_revs:
+                if r["review_id"] not in seen_pos_ids:
+                    seen_pos_ids.add(r["review_id"])
+                    pos_reviews.append(r)
+                    new_added += 1
+                    if len(pos_reviews) >= target_pos:
+                        break
+            if new_added == 0:
+                break
+            time.sleep(random.uniform(0.3, 0.6))
 
-        return crit_reviews[:target_crit] + pos_reviews[:target_pos]
+        all_collected = crit_reviews[:target_crit] + pos_reviews[:target_pos]
+        return all_collected, total_visible_found
 
     if page_handle:
-        collected = execute_with_page(page_handle)
+        collected, total_visible = execute_with_page(page_handle)
     else:
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
@@ -189,7 +247,7 @@ def crawl_amazon_reviews_for_asin(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
             )
             page = context.pages[0] if context.pages else context.new_page()
-            collected = execute_with_page(page)
+            collected, total_visible = execute_with_page(page)
             context.close()
 
     # Save to SQLite with Review Collection Policy provenance metadata
@@ -197,10 +255,11 @@ def crawl_amazon_reviews_for_asin(
         asin=asin,
         keyword=keyword,
         reviews_list=collected,
+        visible_total_reviews=total_visible,
         collection_method=policy_tier,
         filters_applied=["critical_1_3_star", "positive_5_star"]
     )
-    print(f"[ReviewCrawler] ASIN {asin} ({policy_tier}): Collected {len(collected)} reviews ({saved_count} saved).")
+    print(f"[ReviewCrawler] ASIN {asin} ({policy_tier}): Collected {len(collected)} reviews ({saved_count} saved, {total_visible} visible total).")
     return collected
 
 

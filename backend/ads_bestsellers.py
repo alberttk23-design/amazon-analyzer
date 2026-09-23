@@ -202,10 +202,10 @@ def crawl_best_sellers(category_url: str = None, category_name: str = "Best Sell
                 price = float(price_match.group(1).replace(",", "")) if price_match else 0.0
 
                 rating_match = re.search(r"([\d\.]+)", item.get("ratingText", ""))
-                rating = float(rating_match.group(1)) if rating_match else 4.5
+                rating = float(rating_match.group(1)) if rating_match else 0.0
 
                 rev_match = re.search(r"([\d,]+)", item.get("reviewsText", ""))
-                rev_count = int(rev_match.group(1).replace(",", "")) if rev_match else 100
+                rev_count = int(rev_match.group(1).replace(",", "")) if rev_match else 0
 
                 asin = item.get("asin") or f"BS_{rank}"
 

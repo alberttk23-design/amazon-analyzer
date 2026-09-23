@@ -73,21 +73,47 @@ def expand_niche_lanes(seed_keyword: str) -> Dict[str, List[str]]:
     # Lane B: Live Search Suggestions from Amazon
     lane_b = fetch_amazon_search_suggestions(kw)
 
-    # Lane C: Buyer Intent / Use-cases
+    # Lane C: Buyer Intent / Use-cases (Domain-Agnostic E-Commerce Intent Vectors)
     lane_c = [
-        f"{kw} for travel",
-        f"{kw} for gym",
-        f"{kw} rechargeable",
-        f"{kw} gift set",
-        f"{kw} portable cordless",
-        f"{kw} upgrade"
+        f"best {kw}",
+        f"{kw} for women",
+        f"{kw} for men",
+        f"{kw} reviews",
+        f"top rated {kw}",
+        f"{kw} gift",
+        f"{kw} upgrade",
+        f"heavy duty {kw}"
     ]
 
     return {
         "keyword_search": lane_a,
         "suggestions": [s for s in lane_b if s not in lane_a],
-        "intent_modifiers": lane_c
+        "intent_modifiers": [s for s in lane_c if s not in lane_a]
     }
+
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "for", "with", "in", "on", "of", "to", "by", "at", "from",
+    "pack", "set", "pcs", "piece", "pieces", "black", "white", "blue", "red", "green", "pink",
+    "inch", "inches", "oz", "ml", "lb", "portable", "new", "upgraded", "2024", "2025", "2026"
+}
+
+def extract_dynamic_query_candidates(seed_keyword: str, discovered_titles: List[str], max_tokens: int = 5) -> List[str]:
+    """
+    Learns high-frequency 2-word phrase patterns from product titles in this specific niche.
+    Adaptive query learning: discovers actual vocabulary used by top sellers.
+    """
+    word_counts: Dict[str, int] = {}
+    seed_tokens = set(seed_keyword.lower().split())
+    for t in discovered_titles:
+        clean_t = re.sub(r"[^a-zA-Z0-9\s]", " ", t.lower())
+        words = [w for w in clean_t.split() if len(w) > 2 and w not in STOPWORDS and w not in seed_tokens]
+        for i in range(len(words) - 1):
+            phrase = f"{words[i]} {words[i+1]}"
+            word_counts[phrase] = word_counts.get(phrase, 0) + 1
+
+    sorted_phrases = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
+    return [f"{p[0]} {seed_keyword}" for p in sorted_phrases[:max_tokens]]
 
 
 # ---------------------------------------------------------
@@ -211,7 +237,7 @@ def extract_cheap_products_from_html(
 
         # Rating
         star_el = card.select_one(".a-icon-star-small .a-icon-alt, .a-icon-alt")
-        rating = parse_rating(star_el.get_text(strip=True)) if star_el else 4.2
+        rating = parse_rating(star_el.get_text(strip=True)) if star_el else 0.0
 
         # Reviews Count
         rev_el = card.select_one("a[href*='#customerReviews'] span, span[aria-label*='ratings']")
@@ -257,13 +283,11 @@ def extract_cheap_products_from_html(
         # Brand
         brand_el = card.select_one("h5 .a-size-base-plus, .a-row.a-size-base.a-color-secondary .a-size-base")
         brand = brand_el.get_text(strip=True) if brand_el else ""
-        if not brand and title:
-            brand = title.split()[0]
 
         # Score calculation (Sales 45%, Reviews 25%, Rating 20%, Badges 10%)
         sales_score = min(bought_month / 2000.0, 1.0) * 45.0
         reviews_score = min(reviews_count / 5000.0, 1.0) * 25.0
-        rating_norm = max(0.0, min((rating - 3.5) / 1.5, 1.0)) * 20.0
+        rating_norm = max(0.0, min((rating - 3.5) / 1.5, 1.0)) * 20.0 if rating > 0 else 0.0
         badge_score = (6.0 if is_best_seller else 0.0) + (4.0 if is_choice else 0.0)
         score = round(max(5.0, min(sales_score + reviews_score + rating_norm + badge_score, 100.0)), 1)
 
@@ -273,7 +297,7 @@ def extract_cheap_products_from_html(
             "keyword": niche,
             "title": title,
             "brand": brand,
-            "seller": brand or "Amazon Seller",
+            "seller": "",
             "price": price,
             "original_price": orig_price,
             "currency": "USD",
@@ -492,7 +516,7 @@ def run_breadth_discovery_saturation_loop(
 
     logger.info(f"[BreadthCrawler] Initial universe for '{niche}' has {initial_count} ASINs.")
 
-    # 1. Multi-lane expansion and queue persistence (Checkpoint / Resume)
+    # 1. Multi-lane expansion and queue persistence (Composite UNIQUE(niche, query))
     lanes = expand_niche_lanes(seed_keyword)
     queue_entries: List[Tuple[str, str, int]] = []
 
@@ -505,15 +529,13 @@ def run_breadth_discovery_saturation_loop(
 
     db.enqueue_discovery_queries(niche, queue_entries)
 
-    # Fetch pending queries from queue
-    pending_items = db.get_pending_discovery_queries(niche, limit=max_queries)
-    if not pending_items:
-        logger.info(f"[BreadthCrawler] No pending queries found in queue for '{niche}'. Re-enqueueing base lanes...")
-        for lane, q, prio in queue_entries:
-            db.mark_discovery_query_status(niche, q, "pending")
-        pending_items = db.get_pending_discovery_queries(niche, limit=max_queries)
+    # 2. Reclaim any stale in_progress queries from crashes or interruptions
+    reclaimed = db.reclaim_stale_in_progress_queries(niche, timeout_minutes=15)
+    if reclaimed > 0:
+        logger.info(f"[BreadthCrawler] Reclaimed {reclaimed} stale in-progress queries for '{niche}'.")
 
     discovered_brands: Set[str] = set()
+    discovered_titles: List[str] = []
     consecutive_low_yield_count = 0
     queries_executed = 0
     total_new_discovered = 0
@@ -524,9 +546,11 @@ def run_breadth_discovery_saturation_loop(
     fetcher = StrategyLadderFetcher()
     db.create_research_run(session_id, niche)
 
-    for item in pending_items:
-        if queries_executed >= max_queries:
-            logger.info(f"[BreadthCrawler] Reached max query limit ({max_queries}). Ending breadth pass.")
+    # Dynamic Queue Loop: dynamically pulls newly enqueued brand & vocabulary queries in the SAME run
+    while queries_executed < max_queries:
+        item = db.get_next_pending_query(niche)
+        if not item:
+            logger.info(f"[BreadthCrawler] Queue exhausted for '{niche}' or all queries processed.")
             break
 
         lane = item.get("lane", "keyword_search")
@@ -536,11 +560,16 @@ def run_breadth_discovery_saturation_loop(
         queries_executed += 1
         query_new_asins = 0
         query_total_asins = 0
+        consecutive_zero_page_count = 0
 
-        # Multi-Page Pagination Loop (Page 1 to max_pages_per_query)
-        for page_num in range(1, max_pages_per_query + 1):
+        # True Page-Level Checkpoint / Resume
+        start_page = max(1, item.get("next_page", 1))
+        target_pages = item.get("target_pages", max_pages_per_query)
+
+        # Multi-Page Pagination Loop (Page start_page to target_pages)
+        for page_num in range(start_page, target_pages + 1):
             search_url = f"https://www.amazon.com/s?k={quote(query)}&page={page_num}" if page_num > 1 else f"https://www.amazon.com/s?k={quote(query)}"
-            logger.info(f"[BreadthCrawler] [{queries_executed}/{max_queries}] [{lane}] Query: '{query}' (Page {page_num}/{max_pages_per_query}) -> {search_url}")
+            logger.info(f"[BreadthCrawler] [{queries_executed}/{max_queries}] [{lane}] Query: '{query}' (Page {page_num}/{target_pages}) -> {search_url}")
 
             if job_id:
                 prog = 10 + int((queries_executed / max_queries) * 60)
@@ -571,6 +600,7 @@ def run_breadth_discovery_saturation_loop(
                     status=f"empty_or_{status}",
                     strategy_used=strategy_used
                 )
+                db.update_query_progress(niche, query, page_num, status="in_progress", error=f"empty_or_{status}")
                 break
 
             products, observations = extract_cheap_products_from_html(
@@ -579,6 +609,7 @@ def run_breadth_discovery_saturation_loop(
             asins_found_page = len(products)
             if asins_found_page == 0:
                 parser_partial += 1
+                db.update_query_progress(niche, query, page_num, status="in_progress", error="zero_products_parsed")
                 break
 
             page_new_unique = 0
@@ -586,6 +617,9 @@ def run_breadth_discovery_saturation_loop(
 
             for p in products:
                 asin = p["asin"]
+                if p.get("title"):
+                    discovered_titles.append(p["title"])
+
                 if asin in cumulative_unique:
                     page_duplicates += 1
                 else:
@@ -596,8 +630,8 @@ def run_breadth_discovery_saturation_loop(
                         discovered_brands.add(p["brand"])
                         db.upsert_brand_entity(p["brand"], niche)
 
-                # Save 100% of discovered candidates to DB (Never throw away!)
-                db.save_product(p, record_snapshot=True)
+                # Save candidate entity without bloating product_snapshots on every search card
+                db.save_product(p, record_snapshot=False)
 
             # Record granular search observations for every card (Sponsored vs Organic with exact position)
             for obs in observations:
@@ -605,6 +639,9 @@ def run_breadth_discovery_saturation_loop(
 
             query_new_asins += page_new_unique
             query_total_asins += asins_found_page
+
+            # Update page progress in queue checkpoint
+            db.update_query_progress(niche, query, page_num, status="in_progress")
 
             # Log entry to Coverage Ledger for this specific page
             db.record_coverage_ledger_entry(
@@ -623,10 +660,14 @@ def run_breadth_discovery_saturation_loop(
 
             logger.info(f" -> [Page {page_num}] Found: {asins_found_page} | New: {page_new_unique} | Cumulative: {len(cumulative_unique)}")
 
-            # If page 2+ brought 0 new ASINs, early-stop pagination for this query
-            if page_num > 1 and page_new_unique == 0:
-                logger.info(f"[BreadthCrawler] Page {page_num} yielded 0 new unique ASINs. Stopping pagination for '{query}'.")
-                break
+            # Robust Saturation Check: Require 2 consecutive zero-yield pages before breaking
+            if page_new_unique == 0:
+                consecutive_zero_page_count += 1
+                if consecutive_zero_page_count >= 2:
+                    logger.info(f"[BreadthCrawler] 2 consecutive pages yielded 0 new unique ASINs. Stopping pagination for '{query}'.")
+                    break
+            else:
+                consecutive_zero_page_count = 0
 
             # If no active next page button, stop paginating this query
             if not check_has_next_page(html):
@@ -651,10 +692,16 @@ def run_breadth_discovery_saturation_loop(
         # Dynamically inject high-signal brand queries into queue
         if discovered_brands:
             brand_injections: List[Tuple[str, str, int]] = []
-            for b in list(discovered_brands)[:3]:
+            for b in list(discovered_brands)[:4]:
                 brand_query = f"{b} {seed_keyword}"
                 brand_injections.append(("brand_expansion", brand_query, 4))
             db.enqueue_discovery_queries(niche, brand_injections)
+
+        # Dynamically learn 2-word phrase queries from discovered titles
+        if len(discovered_titles) >= 15 and queries_executed % 3 == 0:
+            learned_queries = extract_dynamic_query_candidates(seed_keyword, discovered_titles, max_tokens=3)
+            learned_injections = [("adaptive_vocabulary", lq, 5) for lq in learned_queries]
+            db.enqueue_discovery_queries(niche, learned_injections)
 
         time.sleep(random.uniform(0.5, 1.2))
 

@@ -37,6 +37,115 @@ def parse_detail_price(text: str) -> float:
     return 0.0
 
 
+def extract_balanced_json_object(text: str, keyword: str) -> Optional[Dict[str, Any]]:
+    """
+    Scans text for keyword, then finds the next '{' and balances braces { }
+    accounting for string literals and escape characters to extract a valid JSON object.
+    Handles arbitrary nesting without regex truncation bugs.
+    """
+    if not text or not keyword:
+        return None
+    pos = 0
+    while True:
+        idx = text.find(keyword, pos)
+        if idx == -1:
+            return None
+        brace_start = text.find('{', idx + len(keyword))
+        if brace_start == -1:
+            pos = idx + len(keyword)
+            continue
+
+        between = text[idx + len(keyword):brace_start].strip()
+        if not all(c in ':=" \t\r\n' for c in between):
+            pos = idx + len(keyword)
+            continue
+
+        depth = 0
+        in_string = False
+        escape = False
+        parsed_obj = None
+        for i in range(brace_start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        json_str = text[brace_start:i+1]
+                        try:
+                            parsed_obj = json.loads(json_str)
+                        except Exception:
+                            pass
+                        break
+        if parsed_obj is not None and isinstance(parsed_obj, dict):
+            return parsed_obj
+        pos = idx + len(keyword)
+
+
+def extract_balanced_json_array(text: str, keyword: str) -> Optional[List[Any]]:
+    """
+    Scans text for keyword, then finds the next '[' and balances brackets [ ]
+    accounting for string literals and escape characters to extract a valid JSON array.
+    """
+    if not text or not keyword:
+        return None
+    pos = 0
+    while True:
+        idx = text.find(keyword, pos)
+        if idx == -1:
+            return None
+        bracket_start = text.find('[', idx + len(keyword))
+        if bracket_start == -1:
+            pos = idx + len(keyword)
+            continue
+
+        between = text[idx + len(keyword):bracket_start].strip()
+        if not all(c in ':=" \t\r\n' for c in between):
+            pos = idx + len(keyword)
+            continue
+
+        depth = 0
+        in_string = False
+        escape = False
+        parsed_arr = None
+        for i in range(bracket_start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if ch == '[':
+                    depth += 1
+                elif ch == ']':
+                    depth -= 1
+                    if depth == 0:
+                        json_str = text[bracket_start:i+1]
+                        try:
+                            parsed_arr = json.loads(json_str)
+                        except Exception:
+                            pass
+                        break
+        if parsed_arr is not None and isinstance(parsed_arr, list):
+            return parsed_arr
+        pos = idx + len(keyword)
+
+
 def scrape_amazon_product_detail_and_variations(
     asin: str,
     niche: str = "",
@@ -87,7 +196,7 @@ def scrape_amazon_product_detail_and_variations(
 
                 // Availability
                 const availEl = document.querySelector('#availability span, #outOfStock span');
-                const availability = availEl ? availEl.innerText.trim() : 'In Stock';
+                const availability = availEl ? availEl.innerText.trim() : 'UNKNOWN';
 
                 // Rating & Review Count
                 const rEl = document.querySelector('#acrPopover span.a-icon-alt');
@@ -116,54 +225,193 @@ def scrape_amazon_product_detail_and_variations(
                     }
                 }
 
+                // Balanced bracket parser inside browser context
+                function extractBalancedJson(text, keyword) {
+                    let pos = 0;
+                    while (pos < text.length) {
+                        const idx = text.indexOf(keyword, pos);
+                        if (idx === -1) return null;
+                        const start = text.indexOf('{', idx + keyword.length);
+                        if (start === -1) { pos = idx + keyword.length; continue; }
+
+                        const between = text.substring(idx + keyword.length, start).trim();
+                        if (!/^[:="\\s]*$/.test(between)) { pos = idx + keyword.length; continue; }
+
+                        let depth = 0;
+                        let inString = false;
+                        let escape = false;
+                        for (let i = start; i < text.length; i++) {
+                            const ch = text[i];
+                            if (escape) { escape = false; continue; }
+                            if (ch === '\\\\') { escape = true; continue; }
+                            if (ch === '"') { inString = !inString; continue; }
+                            if (!inString) {
+                                if (ch === '{') depth++;
+                                else if (ch === '}') {
+                                    depth--;
+                                    if (depth === 0) {
+                                        try {
+                                            return JSON.parse(text.substring(start, i + 1));
+                                        } catch (e) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pos = idx + keyword.length;
+                    }
+                    return null;
+                }
+
+                function extractBalancedArray(text, keyword) {
+                    let pos = 0;
+                    while (pos < text.length) {
+                        const idx = text.indexOf(keyword, pos);
+                        if (idx === -1) return null;
+                        const start = text.indexOf('[', idx + keyword.length);
+                        if (start === -1) { pos = idx + keyword.length; continue; }
+
+                        const between = text.substring(idx + keyword.length, start).trim();
+                        if (!/^[:="\\s]*$/.test(between)) { pos = idx + keyword.length; continue; }
+
+                        let depth = 0;
+                        let inString = false;
+                        let escape = false;
+                        for (let i = start; i < text.length; i++) {
+                            const ch = text[i];
+                            if (escape) { escape = false; continue; }
+                            if (ch === '\\\\') { escape = true; continue; }
+                            if (ch === '"') { inString = !inString; continue; }
+                            if (!inString) {
+                                if (ch === '[') depth++;
+                                else if (ch === ']') {
+                                    depth--;
+                                    if (depth === 0) {
+                                        try {
+                                            return JSON.parse(text.substring(start, i + 1));
+                                        } catch (e) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pos = idx + keyword.length;
+                    }
+                    return null;
+                }
+
                 // Parent/Child ASIN & Variation Dimensions (Spigen pattern)
                 let parentAsin = '';
-                let childAsins = [];
-                let dimensions = {};
+                let childVariations = {}; // child_asin -> { Color: "Black", Size: "M" }
+                let dimensionsDisplay = [];
+                let dimDisplayData = null;
+                let asinToDimMap = null;
 
+                // 1. Scan script tags
                 const scripts = Array.from(document.querySelectorAll('script'));
                 for (const s of scripts) {
                     const txt = s.innerText || '';
-                    if (txt.includes('dimensionValuesDisplayData') || txt.includes('asinToDimensionIndexMap')) {
-                        try {
-                            const dimMatch = txt.match(/"dimensionValuesDisplayData"\\s*:\\s*({[^}]+})/);
-                            if (dimMatch) dimensions = JSON.parse(dimMatch[1]);
-                        } catch(e) {}
-                        try {
-                            const asinMapMatch = txt.match(/"asinToDimensionIndexMap"\\s*:\\s*({[^}]+})/);
-                            if (asinMapMatch) {
-                                const mapObj = JSON.parse(asinMapMatch[1]);
-                                childAsins = Object.keys(mapObj);
-                            }
-                        } catch(e) {}
-                        try {
-                            const pMatch = txt.match(/"parentAsin"\\s*:\\s*"([A-Z0-9]{10})"/);
-                            if (pMatch) parentAsin = pMatch[1];
-                        } catch(e) {}
+                    if (!txt) continue;
+
+                    if (!parentAsin && txt.includes('parentAsin')) {
+                        const pMatch = txt.match(/"parentAsin"\\s*:\\s*"([A-Z0-9]{10})"/);
+                        if (pMatch) parentAsin = pMatch[1];
+                    }
+
+                    if (txt.includes('dimensionValuesDisplayData')) {
+                        const parsed = extractBalancedJson(txt, 'dimensionValuesDisplayData');
+                        if (parsed && typeof parsed === 'object') {
+                            dimDisplayData = parsed;
+                        }
+                    }
+
+                    if (txt.includes('dimensionsDisplay')) {
+                        const parsedArr = extractBalancedArray(txt, 'dimensionsDisplay');
+                        if (parsedArr && Array.isArray(parsedArr)) {
+                            dimensionsDisplay = parsedArr;
+                        }
+                    }
+
+                    if (txt.includes('asinToDimensionIndexMap')) {
+                        const parsedMap = extractBalancedJson(txt, 'asinToDimensionIndexMap');
+                        if (parsedMap && typeof parsedMap === 'object') {
+                            asinToDimMap = parsedMap;
+                        }
                     }
                 }
 
-                // Fallback to DOM variation elements
-                if (childAsins.length === 0) {
-                    const swatches = document.querySelectorAll('li[data-defaultasin], div[data-defaultasin], li[data-csa-c-item-id]');
-                    const cSet = new Set();
-                    swatches.forEach(el => {
-                        const a = el.getAttribute('data-defaultasin') || el.getAttribute('data-csa-c-item-id');
-                        if (a && a.length === 10) cSet.add(a);
-                    });
-                    childAsins = Array.from(cSet);
+                // 2. Scan a-state scripts and containers
+                document.querySelectorAll('script[type="a-state"], div[data-a-state]').forEach(el => {
+                    try {
+                        const content = (el.textContent || el.innerText || '').trim();
+                        if (content.startsWith('{') && content.endsWith('}')) {
+                            const parsed = JSON.parse(content);
+                            if (parsed.parentAsin && !parentAsin) parentAsin = parsed.parentAsin;
+                            if (parsed.dimensionValuesDisplayData && !dimDisplayData) dimDisplayData = parsed.dimensionValuesDisplayData;
+                            if (parsed.dimensionsDisplay && dimensionsDisplay.length === 0) dimensionsDisplay = parsed.dimensionsDisplay;
+                            if (parsed.asinToDimensionIndexMap && !asinToDimMap) asinToDimMap = parsed.asinToDimensionIndexMap;
+                        }
+                    } catch(e) {}
+                });
+
+                // 3. Fallback for parent ASIN from DOM
+                if (!parentAsin) {
+                    const pInput = document.querySelector('input#parentAsin, input[name="parentAsin"], #twister_parent_asin');
+                    if (pInput && pInput.value && pInput.value.length === 10) {
+                        parentAsin = pInput.value.trim();
+                    }
                 }
 
-                if (Object.keys(dimensions).length === 0) {
-                    const dimDivs = document.querySelectorAll('div[id^="variation_"]');
-                    dimDivs.forEach(d => {
-                        const label = d.querySelector('.a-form-label');
-                        const val = d.querySelector('.selection');
-                        if (label && val) {
-                            dimensions[label.innerText.replace(':', '').trim()] = [val.innerText.trim()];
+                // 4. Map child variations
+                if (dimDisplayData) {
+                    for (const [cAsin, valArray] of Object.entries(dimDisplayData)) {
+                        if (typeof cAsin === 'string' && cAsin.length === 10) {
+                            if (!childVariations[cAsin]) childVariations[cAsin] = {};
+                            if (Array.isArray(valArray)) {
+                                valArray.forEach((v, idx) => {
+                                    const dName = (dimensionsDisplay && dimensionsDisplay[idx]) ? dimensionsDisplay[idx] : `Dimension_${idx+1}`;
+                                    childVariations[cAsin][dName] = String(v);
+                                });
+                            } else if (typeof valArray === 'object' && valArray !== null) {
+                                Object.assign(childVariations[cAsin], valArray);
+                            }
+                        }
+                    }
+                }
+
+                if (asinToDimMap) {
+                    for (const cAsin of Object.keys(asinToDimMap)) {
+                        if (typeof cAsin === 'string' && cAsin.length === 10) {
+                            if (!childVariations[cAsin]) childVariations[cAsin] = {};
+                        }
+                    }
+                }
+
+                // 5. Fallback DOM swatch elements if child ASINs empty
+                if (Object.keys(childVariations).length === 0) {
+                    const swatches = document.querySelectorAll('li[data-defaultasin], div[data-defaultasin], li[data-csa-c-item-id]');
+                    swatches.forEach(el => {
+                        const a = el.getAttribute('data-defaultasin') || el.getAttribute('data-csa-c-item-id');
+                        if (a && a.length === 10) {
+                            childVariations[a] = childVariations[a] || {};
                         }
                     });
                 }
+
+                const childAsins = Object.keys(childVariations);
+
+                // Fallback dimensions from DOM if empty
+                const domDimensions = {};
+                const dimDivs = document.querySelectorAll('div[id^="variation_"]');
+                dimDivs.forEach(d => {
+                    const label = d.querySelector('.a-form-label');
+                    const val = d.querySelector('.selection');
+                    if (label && val) {
+                        domDimensions[label.innerText.replace(':', '').trim()] = val.innerText.trim();
+                    }
+                });
 
                 return {
                     title,
@@ -178,7 +426,9 @@ def scrape_amazon_product_detail_and_variations(
                     bsrCategory,
                     parentAsin,
                     childAsins,
-                    dimensions
+                    childVariations,
+                    domDimensions,
+                    dimensionsDisplay
                 };
             }""")
 
@@ -188,23 +438,25 @@ def scrape_amazon_product_detail_and_variations(
             # Resolve Parent vs Child identity
             parent_asin = data.get("parentAsin") or (asin if data.get("childAsins") else "")
             child_asins = data.get("childAsins") or []
+            child_variations = data.get("childVariations") or {}
+            dom_dimensions = data.get("domDimensions") or {}
             is_parent = 1 if asin == parent_asin or (child_asins and asin not in child_asins) else 0
 
-            # 1. Update this ASIN in DB
+            # 1. Update this canonical ASIN in DB
             product_dict = {
                 "asin": asin,
                 "url": detail_url,
                 "keyword": niche or "default",
-                "title": data.get("title") or f"Product {asin}",
+                "title": data.get("title") or "",
                 "brand": data.get("brand") or "",
                 "price": price,
                 "original_price": original_price,
-                "availability": data.get("availability") or "In Stock",
+                "availability": data.get("availability") or "UNKNOWN",
                 "bsr_rank": data.get("bsrRank", 0),
                 "bsr_category": data.get("bsrCategory", ""),
                 "parent_asin": parent_asin,
                 "is_parent": is_parent,
-                "variation_dimensions_json": json.dumps(data.get("dimensions", {}), ensure_ascii=False),
+                "variation_dimensions_json": json.dumps(child_variations.get(asin, dom_dimensions), ensure_ascii=False),
                 "child_asins_json": json.dumps(child_asins),
                 "variant_count": max(1, len(child_asins)),
                 "completeness_status": "complete",
@@ -212,30 +464,52 @@ def scrape_amazon_product_detail_and_variations(
             }
             db.save_product(product_dict, record_snapshot=True)
 
-            # 2. Preserve Child ASINs as First-Class Entities ("Group but do not flatten")
-            for child in child_asins:
-                if child != asin:
-                    db.save_product({
-                        "asin": child,
-                        "url": f"https://www.amazon.com/dp/{child}",
-                        "keyword": niche or "default",
-                        "title": f"{data.get('title', '')} (Variant {child})",
-                        "brand": data.get("brand") or "",
-                        "parent_asin": parent_asin or asin,
-                        "is_parent": 0,
-                        "tier": "COLD",
-                        "completeness_status": "partial",
-                        "product_depth": "SHALLOW",
-                        "tier_reason": f"child_variant_of_{asin}"
-                    }, record_snapshot=False)
+            # 2. Save explicit variation attribute mapping to product_variations table
+            parent_key = parent_asin or asin
+            if parent_key:
+                # Save self if in variations
+                self_dims = child_variations.get(asin, dom_dimensions)
+                db.save_product_variation(
+                    parent_asin=parent_key,
+                    child_asin=asin,
+                    dimensions=self_dims,
+                    price=price,
+                    availability=data.get("availability") or "UNKNOWN"
+                )
 
-            logger.info(f"[DetailParser] Successfully parsed ASIN {asin} | Parent: {parent_asin} | {len(child_asins)} Children")
+                for child in child_asins:
+                    child_dims = child_variations.get(child, {})
+                    db.save_product_variation(
+                        parent_asin=parent_key,
+                        child_asin=child,
+                        dimensions=child_dims,
+                        price=price if child == asin else 0.0,
+                        availability=data.get("availability") if child == asin else "UNKNOWN"
+                    )
+
+                    # 3. Preserve Child ASINs as First-Class Entities ("Group but do not flatten")
+                    if child != asin:
+                        db.save_product({
+                            "asin": child,
+                            "url": f"https://www.amazon.com/dp/{child}",
+                            "keyword": niche or "default",
+                            "title": f"{data.get('title', '')} (Variant {child})",
+                            "brand": data.get("brand") or "",
+                            "parent_asin": parent_key,
+                            "is_parent": 0,
+                            "tier": "COLD",
+                            "completeness_status": "partial",
+                            "product_depth": "SHALLOW",
+                            "tier_reason": f"child_variant_of_{asin}"
+                        }, record_snapshot=False)
+
+            logger.info(f"[DetailParser] Successfully parsed ASIN {asin} | Parent: {parent_key} | {len(child_asins)} Children")
             return {
                 "status": "complete",
                 "asin": asin,
-                "parent_asin": parent_asin,
+                "parent_asin": parent_key,
                 "child_asins_count": len(child_asins),
-                "dimensions": data.get("dimensions", {})
+                "child_variations": child_variations
             }
         except Exception as e:
             logger.error(f"[DetailParser] Error parsing {detail_url}: {e}")

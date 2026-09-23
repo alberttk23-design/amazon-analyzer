@@ -14,47 +14,64 @@ logger = logging.getLogger("amazon.promotion")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def calculate_product_promotion_signals(product: Dict[str, Any]) -> Tuple[float, str]:
+def calculate_product_promotion_signals(product: Dict[str, Any], niche: Optional[str] = None) -> Tuple[float, str]:
     """
-    Computes dynamic promotion score and classification reason based on multi-signal indicators:
-    - Review Velocity (+25 pts for fast review growth)
+    Computes viability and priority score based on multi-dimensional market signals:
     - High Complaint Opportunity (+30 pts for high sales & low rating <= 3.9★)
-    - Active PPC Advertiser (+20 pts for sponsored placement)
+    - Review Velocity (+25 pts for fast review growth)
+    - Cross-Query PPC Advertising (+20 pts for multi-query or high-share sponsored observations)
+    - Organic Market Leadership (+25 pts for top-5 organic rank across multiple queries)
     - Sales Velocity (+25 pts for high monthly volume)
     - Price Drops (+15 pts for recent discount)
     """
     score = 0.0
     reasons = []
 
+    asin = product.get("asin", "")
+    niche_name = niche or product.get("keyword") or product.get("niche") or ""
     price = float(product.get("price") or 0.0)
     orig_price = float(product.get("original_price") or price)
-    rating = float(product.get("rating") or 4.0)
+    rating = float(product.get("rating") or 0.0)
     sales = int(product.get("bought_past_month") or 0)
-    is_sponsored = bool(product.get("is_sponsored"))
     rev_velocity = float(product.get("review_velocity") or 0.0)
 
-    # 1. High Complaint Density (VoC Flaw Mining)
-    if sales >= 300 and rating <= 3.9:
+    # 1. Observation Analytics from search_observations
+    obs_metrics = db.get_asin_observation_metrics(asin, niche_name) if (asin and niche_name) else {}
+    spon_queries = obs_metrics.get("sponsored_query_count", 0)
+    spon_share = obs_metrics.get("sponsored_share", 0.0)
+    org_best_pos = obs_metrics.get("organic_best_position")
+    org_cov = obs_metrics.get("organic_query_coverage", 0)
+
+    # 2. High Complaint Density (VoC Flaw Mining)
+    if sales >= 300 and 0.0 < rating <= 3.9:
         score += 30.0
         reasons.append("high_complaint_goldmine")
 
-    # 2. Review Velocity Outliers
+    # 3. Review Velocity Outliers
     if rev_velocity > 5:
         score += min(rev_velocity * 2.0, 25.0)
         reasons.append("rapid_review_growth")
 
-    # 3. Active PPC Advertiser
-    if is_sponsored:
+    # 4. Observation-Based PPC Advertiser (Multi-query or high ad share)
+    if spon_queries >= 2 or spon_share >= 0.4:
         score += 20.0
-        reasons.append("ad_active")
+        reasons.append(f"ad_active_cross_query({spon_queries}q)")
+    elif spon_queries == 1 or bool(product.get("is_sponsored")):
+        score += 10.0
+        reasons.append("ad_active_single_query")
 
-    # 4. Sales Velocity
+    # 5. Observation-Based Organic Market Leader
+    if org_best_pos is not None and org_best_pos <= 5 and org_cov >= 2:
+        score += 25.0
+        reasons.append(f"organic_leader(pos#{org_best_pos})")
+
+    # 6. Sales Velocity
     sales_pts = min(sales / 2000.0, 1.0) * 25.0
     score += sales_pts
     if sales >= 1000:
         reasons.append("high_sales_volume")
 
-    # 5. Price Discount / Drop
+    # 7. Price Discount / Drop
     if orig_price > price and price > 0:
         discount_pct = (orig_price - price) / orig_price
         if discount_pct >= 0.15:
@@ -78,7 +95,7 @@ def compute_and_update_niche_promotions(keyword: str) -> Dict[str, Any]:
     for cand in candidates:
         asin = cand["asin"]
         current_tier = cand.get("tier", "COLD")
-        score, reason = calculate_product_promotion_signals(cand)
+        score, reason = calculate_product_promotion_signals(cand, niche=keyword)
 
         # Decide tier promotion
         new_tier = current_tier
@@ -93,7 +110,8 @@ def compute_and_update_niche_promotions(keyword: str) -> Dict[str, Any]:
             asin=asin,
             new_tier=new_tier,
             reason=reason,
-            promotion_score=score
+            promotion_score=score,
+            niche=keyword
         )
         updated_count += 1
 
